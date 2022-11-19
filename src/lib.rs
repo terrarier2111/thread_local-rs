@@ -78,12 +78,15 @@ pub use cached::{CachedIntoIter, CachedIterMut, CachedThreadLocal};
 use crate::thread_id::ThreadHolder;
 use std::cell::UnsafeCell;
 use std::fmt;
+use std::fmt::{Debug, Display, Formatter};
 use std::iter::FusedIterator;
 use std::mem;
-use std::mem::MaybeUninit;
+use std::mem::{MaybeUninit, transmute};
+use std::ops::{Deref, DerefMut};
 use std::panic::UnwindSafe;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::ptr::{addr_of, read};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use thread_id::Thread;
 use unreachable::UncheckedResultExt;
 
@@ -104,7 +107,7 @@ const BUCKETS: usize = (POINTER_WIDTH + 1) as usize;
 pub struct ThreadLocal<T: Send> {
     /// The buckets in the thread local. The nth bucket contains `2^(n-1)`
     /// elements. Each bucket is lazily allocated.
-    buckets: [AtomicPtr<Entry<T>>; BUCKETS],
+    buckets: [AtomicPtr<Option<NoNiche<T>>>; BUCKETS],
 
     /// The number of values in the thread local. This can be less than the real number of values,
     /// but is never more.
@@ -112,18 +115,52 @@ pub struct ThreadLocal<T: Send> {
 }
 
 struct Entry<T> {
-    present: AtomicBool,
-    value: UnsafeCell<MaybeUninit<T>>,
+    // we use the option in here to indicate whether the value is present or not
+    // and its discriminant should be updated atomically
+    value: UnsafeCell<Option<NoNiche<T>>>,
 }
 
-impl<T> Drop for Entry<T> {
-    fn drop(&mut self) {
-        unsafe {
-            if *self.present.get_mut() {
-                ptr::drop_in_place((*self.value.get()).as_mut_ptr());
+impl<T> Entry<T> {
+
+    const ORDINAL_BIT: usize = {
+        let tmp = Some(MaybeUninit::zeroed());
+        let ptr = addr_of!(tmp);
+        let mut global_bit = 0;
+        let mut result = usize::MAX;
+        while global_bit < mem::size_of::<T>() * 8 {
+            let byte = global_bit / 8;
+            let local_bit = global_bit % 8;
+            if (unsafe { ((ptr as usize + byte) as *const u8).read() } & local_bit) != 0 {
+                result = global_bit;
             }
         }
+        result
+    };
+
+    #[inline]
+    fn empty() -> Self {
+        Entry {
+            value: UnsafeCell::new(None),
+        }
     }
+
+    #[inline]
+    fn update_present(&self, val: bool, ordering: Ordering) {
+        let byte_ptr = unsafe { ((((self as *const Self) as usize) + Self::ORDINAL_BIT / 8) as *const AtomicU8).as_ref().unwrap_unchecked() };
+        let bit = (Self::ORDINAL_BIT % 8) as u8;
+        if val {
+            byte_ptr.fetch_or(1 << bit, ordering);
+        } else {
+            byte_ptr.fetch_and(!(1 << bit), ordering);
+        }
+    }
+
+    fn is_present(&self, ordering: Ordering) -> bool {
+        let byte_ptr = unsafe { ((((self as *const Self) as usize) + Self::ORDINAL_BIT / 8) as *const AtomicU8).as_ref().unwrap_unchecked() };
+        let bit = (Self::ORDINAL_BIT % 8) as u8;
+        byte_ptr.load(ordering) & bit != 0
+    }
+
 }
 
 // ThreadLocal is always Sync, even if T isn't
@@ -192,9 +229,9 @@ impl<T: Send> ThreadLocal<T> {
 
     /// Returns the element for the current thread, if it exists.
     #[cfg(feature = "nightly")]
-    pub fn get(&self) -> Option<&T> {
+    pub fn get(&self) -> &Option<NoNiche<T>> {
         match unsafe { thread_id::THREAD_HOLDER.as_ref() } {
-            None => None,
+            None => &None,
             Some(x) => self.get_inner(&x.0),
         }
     }
@@ -250,20 +287,16 @@ impl<T: Send> ThreadLocal<T> {
         }
     }
 
-    fn get_inner(&self, thread: &Thread) -> Option<&T> {
+    fn get_inner(&self, thread: &Thread) -> &Option<NoNiche<T>> {
         let bucket_ptr =
             unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
         if bucket_ptr.is_null() {
-            return None;
+            return &None;
         }
         unsafe {
             let entry = &*bucket_ptr.add(thread.index);
             // Read without atomic operations as only this thread can set the value.
-            if (&entry.present as *const _ as *const bool).read() {
-                Some(&*(&*entry.value.get()).as_ptr())
-            } else {
-                None
-            }
+            entry
         }
     }
 
@@ -314,12 +347,12 @@ impl<T: Send> ThreadLocal<T> {
         // Insert the new element into the bucket
         let entry = unsafe { &*bucket_ptr.add(thread.index) };
         let value_ptr = entry.value.get();
-        unsafe { value_ptr.write(MaybeUninit::new(data)) };
-        entry.present.store(true, Ordering::Release);
+        unsafe { value_ptr.write(Some(MaybeUninit::new(data))) };
+        entry.update_present(true, Ordering::Release);
 
         self.values.fetch_add(1, Ordering::Release);
 
-        unsafe { &*(&*value_ptr).as_ptr() }
+        unsafe { value_ptr.as_ref().unwrap_unchecked().as_ref().unwrap_unchecked() } // FIXME: turn this into a wrapper type!
     }
 
     /// Returns an iterator over the local values of all threads in unspecified
@@ -350,13 +383,77 @@ impl<T: Send> ThreadLocal<T> {
     }
 
     /// Removes all thread-specific values from the `ThreadLocal`, effectively
-    /// reseting it to its original state.
+    /// resetting it to its original state.
     ///
     /// Since this call borrows the `ThreadLocal` mutably, this operation can
     /// be done safely---the mutable borrow statically guarantees no other
     /// threads are currently accessing their associated values.
     pub fn clear(&mut self) {
         *self = ThreadLocal::new();
+    }
+}
+
+pub struct NoNiche<T>(MaybeUninit<T>);
+
+impl<T> NoNiche<T> {
+
+    #[inline]
+    fn new(val: T) -> Self {
+        Self(MaybeUninit::new(val))
+    }
+
+    #[inline]
+    unsafe fn new_uninit() -> Self {
+        Self(MaybeUninit::uninit())
+    }
+
+    #[inline]
+    unsafe fn new_zeroed() -> Self {
+        Self(MaybeUninit::zeroed())
+    }
+
+    #[inline]
+    fn write(&mut self, val: T) {
+        self.0.write(val);
+    }
+
+}
+
+impl<T> Deref for NoNiche<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.0.assume_init_ref() }
+    }
+}
+
+impl<T> AsRef<T> for NoNiche<T> {
+    fn as_ref(&self) -> &T {
+        unsafe { self.0.assume_init_ref() }
+    }
+}
+
+impl<T> DerefMut for NoNiche<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.0.assume_init_mut() }
+    }
+}
+
+impl<T> AsMut<T> for NoNiche<T> {
+    fn as_mut(&mut self) -> &mut T {
+        unsafe { self.0.assume_init_mut() }
+    }
+}
+
+impl<T: Debug> Debug for NoNiche<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        unsafe { self.0.assume_init_ref() }.fmt(f)
+    }
+}
+
+impl<T: Display> Display for NoNiche<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        unsafe { self.0.assume_init_ref() }.fmt(f)
     }
 }
 
@@ -549,8 +646,7 @@ impl<T: Send> Iterator for IntoIter<T> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
         self.raw.next_mut(&mut self.thread_local).map(|entry| {
-            *entry.present.get_mut() = false;
-            unsafe { mem::replace(&mut *entry.value.get(), MaybeUninit::uninit()).assume_init() }
+            unsafe { mem::replace(&mut *entry.value.get(), None).assume_init() }
         })
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -561,18 +657,15 @@ impl<T: Send> Iterator for IntoIter<T> {
 impl<T: Send> ExactSizeIterator for IntoIter<T> {}
 impl<T: Send> FusedIterator for IntoIter<T> {}
 
-fn allocate_bucket<T>(size: usize) -> *mut Entry<T> {
+fn allocate_bucket<T>(size: usize) -> *mut Option<NoNiche<T>> {
     Box::into_raw(
         (0..size)
-            .map(|_| Entry::<T> {
-                present: AtomicBool::new(false),
-                value: UnsafeCell::new(MaybeUninit::uninit()),
-            })
+            .map(|_| None::<T>)
             .collect(),
     ) as *mut _
 }
 
-unsafe fn deallocate_bucket<T>(bucket: *mut Entry<T>, size: usize) {
+unsafe fn deallocate_bucket<T>(bucket: *mut Option<NoNiche<T>>, size: usize) {
     let _ = Box::from_raw(std::slice::from_raw_parts_mut(bucket, size));
 }
 

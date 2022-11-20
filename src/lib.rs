@@ -108,7 +108,7 @@ const BUCKETS: usize = (POINTER_WIDTH + 1) as usize;
 pub struct ThreadLocal<T: Send> {
     /// The buckets in the thread local. The nth bucket contains `2^(n-1)`
     /// elements. Each bucket is lazily allocated.
-    buckets: [CachePadded<AtomicPtr<Entry<T>>>; BUCKETS],
+    buckets: [AtomicPtr<Entry<T>>; BUCKETS],
 
     /// The number of values in the thread local. This can be less than the real number of values,
     /// but is never more.
@@ -177,10 +177,10 @@ impl<T: Send> ThreadLocal<T> {
             .map(|c| usize::from(POINTER_WIDTH) - (c.leading_zeros() as usize) + 1)
             .unwrap_or(0);
 
-        let mut buckets = [CachePadded::new(ptr::null_mut()); BUCKETS];
+        let mut buckets = [null_mut(); BUCKETS];
         let mut bucket_size = 1;
         for (i, bucket) in buckets[..allocated_buckets].iter_mut().enumerate() {
-            *bucket = CachePadded::new(allocate_bucket::<T>(bucket_size));
+            *bucket = allocate_bucket::<T>(bucket_size);
 
             if i != 0 {
                 bucket_size <<= 1;

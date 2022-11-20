@@ -254,17 +254,17 @@ impl<T: Send> ThreadLocal<T> {
 
     #[inline]
     fn get_inner(&self, thread: &Thread) -> Option<&T> {
-        let bucket_ptr_src =
-            unsafe { self.buckets.get_unchecked(thread.bucket) };
-        let bucket_ptr = bucket_ptr_src.load(Ordering::/*Relaxed*/Acquire);
+        // FIXME: if we could somehow make this Relaxed, then we can double get performance
+        let bucket_ptr =
+            unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
         if bucket_ptr.is_null() {
             return None;
         }
         unsafe {
             // Read without atomic operations as only this thread can set the value.
-            let ret = bucket_ptr.add(thread.index).cast::<AtomicPtr<MaybeUninit<T>>>().as_ref().unwrap_unchecked()/*.read_volatile()*/.load(Ordering::Relaxed);
-            if !ret.is_null() {
-                Some(ret.cast::<T>().as_ref().unwrap_unchecked())
+            let ptr = *bucket_ptr.add(thread.index).cast::<*const MaybeUninit<T>>();
+            if !ptr.is_null() {
+                Some(ptr.cast::<T>().as_ref().unwrap_unchecked())
             } else {
                 None
             }
@@ -690,5 +690,4 @@ mod tests {
         foo::<ThreadLocal<String>>();
         foo::<ThreadLocal<RefCell<String>>>();
     }
-
 }

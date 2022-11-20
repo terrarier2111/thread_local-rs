@@ -108,7 +108,7 @@ const BUCKETS: usize = (POINTER_WIDTH + 1) as usize;
 pub struct ThreadLocal<T: Send> {
     /// The buckets in the thread local. The nth bucket contains `2^(n-1)`
     /// elements. Each bucket is lazily allocated.
-    buckets: [AtomicPtr<Entry<T>>; BUCKETS],
+    buckets: [CachePadded<AtomicPtr<Entry<T>>>; BUCKETS],
 
     /// The number of values in the thread local. This can be less than the real number of values,
     /// but is never more.
@@ -177,10 +177,10 @@ impl<T: Send> ThreadLocal<T> {
             .map(|c| usize::from(POINTER_WIDTH) - (c.leading_zeros() as usize) + 1)
             .unwrap_or(0);
 
-        let mut buckets = [ptr::null_mut(); BUCKETS];
+        let mut buckets = [CachePadded::new(ptr::null_mut()); BUCKETS];
         let mut bucket_size = 1;
         for (i, bucket) in buckets[..allocated_buckets].iter_mut().enumerate() {
-            *bucket = allocate_bucket::<T>(bucket_size);
+            *bucket = CachePadded::new(allocate_bucket::<T>(bucket_size));
 
             if i != 0 {
                 bucket_size <<= 1;
@@ -257,8 +257,9 @@ impl<T: Send> ThreadLocal<T> {
 
     #[inline]
     fn get_inner(&self, thread: &Thread) -> Option<&T> {
-        let bucket_ptr =
-            unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Relaxed);
+        let bucket_ptr_src =
+            unsafe { self.buckets.get_unchecked(thread.bucket) };
+        let bucket_ptr = bucket_ptr_src.load(Ordering::/*Relaxed*/Acquire);
         if unlikely(bucket_ptr.is_null()) {
             return None;
         }
@@ -281,7 +282,21 @@ impl<T: Send> ThreadLocal<T> {
             transmute::<*mut MaybeUninit<T>, Option<&T>>(*transmute::<&AtomicPtr<MaybeUninit<T>>, &*mut MaybeUninit<T>>(&entry.value_ptr))*/
 
             // *bucket_ptr.add(thread.index).cast::<Option<&T>>()
-            transmute(bucket_ptr.add(thread.index).cast::<AtomicPtr<MaybeUninit<T>>>().read_volatile().load(Ordering::Acquire))
+            /*let ret = transmute(bucket_ptr.add(thread.index).cast::<AtomicPtr<MaybeUninit<T>>>().as_ref().unwrap_unchecked()/*.read_volatile()*/.load(Ordering::Relaxed));
+            // fence(Ordering::Acquire);
+            ret*/
+            let ret = bucket_ptr.add(thread.index).cast::<AtomicPtr<MaybeUninit<T>>>().as_ref().unwrap_unchecked()/*.read_volatile()*/.load(Ordering::Relaxed);
+            if !ret.is_null() {
+                Some(ret.cast::<T>().as_ref().unwrap_unchecked())
+            } else {
+                None
+            }
+
+            /*
+            let ret = bucket_ptr.add(thread.index).cast::<Option<&T>>();
+            // fence(Ordering::Acquire);
+            bucket_ptr_src.load(Ordering::Acquire);
+            *ret*/
         }
     }
 

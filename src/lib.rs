@@ -58,15 +58,14 @@
 //!
 //! // Once all threads are done, collect the counter values and return the
 //! // sum of all thread-local counter values.
-//! // let tls = Arc::try_unwrap(tls).unwrap();
-//! // let total = tls.into_iter().fold(0, |x, y| x + y.get());
+//! let tls = Arc::try_unwrap(tls).unwrap();
+//! let total = tls.into_iter().fold(0, |x, y| x + y.get());
 //! assert_eq!(total, 5);
 //! ```
 
 #![warn(missing_docs)]
 #![allow(clippy::mutex_atomic)]
 #![cfg_attr(feature = "nightly", feature(thread_local))]
-#![feature(core_intrinsics)]
 
 mod cached;
 mod thread_id;
@@ -79,15 +78,13 @@ pub use cached::{CachedIntoIter, CachedIterMut, CachedThreadLocal};
 use crate::thread_id::ThreadHolder;
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::intrinsics::unlikely;
 use std::iter::FusedIterator;
 use std::mem;
-use std::mem::{MaybeUninit, transmute, transmute_copy};
+use std::mem::MaybeUninit;
 use std::panic::UnwindSafe;
 use std::ptr;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, fence, Ordering};
-use cache_padded::CachePadded;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use thread_id::Thread;
 use unreachable::UncheckedResultExt;
 
@@ -260,43 +257,17 @@ impl<T: Send> ThreadLocal<T> {
         let bucket_ptr_src =
             unsafe { self.buckets.get_unchecked(thread.bucket) };
         let bucket_ptr = bucket_ptr_src.load(Ordering::/*Relaxed*/Acquire);
-        if unlikely(bucket_ptr.is_null()) {
+        if bucket_ptr.is_null() {
             return None;
         }
         unsafe {
-            // let entry = &*bucket_ptr.add(thread.index);
-
-            /*if (&entry.present as *const _ as *const bool).read() {
-                Some(&*(&*entry.value.get()).as_ptr())
-            } else {
-                None
-            }*/
-            // FIXME: Read without atomic operations as only this thread can set the value.
-            /*if !(entry.value_ptr.load(Ordering::Relaxed)).is_null() {
-                Some(&*(&*entry.value.get()).as_ptr())
-            } else {
-                None
-            }*/
-            /*let entry = &*bucket_ptr.add(thread.index);
-            // transmute::<*mut MaybeUninit<T>, Option<&T>>(transmute_copy::<AtomicPtr<MaybeUninit<T>>, *mut MaybeUninit<T>>(&entry.value_ptr))
-            transmute::<*mut MaybeUninit<T>, Option<&T>>(*transmute::<&AtomicPtr<MaybeUninit<T>>, &*mut MaybeUninit<T>>(&entry.value_ptr))*/
-
-            // *bucket_ptr.add(thread.index).cast::<Option<&T>>()
-            /*let ret = transmute(bucket_ptr.add(thread.index).cast::<AtomicPtr<MaybeUninit<T>>>().as_ref().unwrap_unchecked()/*.read_volatile()*/.load(Ordering::Relaxed));
-            // fence(Ordering::Acquire);
-            ret*/
+            // Read without atomic operations as only this thread can set the value.
             let ret = bucket_ptr.add(thread.index).cast::<AtomicPtr<MaybeUninit<T>>>().as_ref().unwrap_unchecked()/*.read_volatile()*/.load(Ordering::Relaxed);
             if !ret.is_null() {
                 Some(ret.cast::<T>().as_ref().unwrap_unchecked())
             } else {
                 None
             }
-
-            /*
-            let ret = bucket_ptr.add(thread.index).cast::<Option<&T>>();
-            // fence(Ordering::Acquire);
-            bucket_ptr_src.load(Ordering::Acquire);
-            *ret*/
         }
     }
 
@@ -326,7 +297,7 @@ impl<T: Send> ThreadLocal<T> {
             let new_bucket = allocate_bucket(thread.bucket_size);
 
             match bucket_atomic_ptr.compare_exchange(
-                ptr::null_mut(),
+                null_mut(),
                 new_bucket,
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -595,22 +566,14 @@ impl<T: Send> ExactSizeIterator for IntoIter<T> {}
 impl<T: Send> FusedIterator for IntoIter<T> {}
 
 fn allocate_bucket<T>(size: usize) -> *mut Entry<T> {
-    let ret: *mut Entry<T> = Box::into_raw(
+    Box::into_raw(
         (0..size)
-            .map(|_| {
-                let ret = Entry::<T> {
-                    value_ptr: AtomicPtr::new(null_mut()),
-                    value: UnsafeCell::new(MaybeUninit::uninit()),
-                };
-                ret.value_ptr.store(null_mut(), Ordering::Release);
-                ret
+            .map(|_| Entry::<T> {
+                value_ptr: AtomicPtr::new(null_mut()),
+                value: UnsafeCell::new(MaybeUninit::uninit()),
             })
             .collect(),
-    ) as *mut _;
-    for entry in 0..size {
-        unsafe { ret.add(entry).as_ref().unwrap_unchecked().value_ptr.store(null_mut(), Ordering::Release); }
-    }
-    ret
+    ) as *mut _
 }
 
 unsafe fn deallocate_bucket<T>(bucket: *mut Entry<T>, size: usize) {
@@ -726,12 +689,6 @@ mod tests {
         fn foo<T: Sync>() {}
         foo::<ThreadLocal<String>>();
         foo::<ThreadLocal<RefCell<String>>>();
-    }
-
-
-    #[test]
-    fn load_heavy() {
-
     }
 
 }

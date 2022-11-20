@@ -262,7 +262,7 @@ impl<T: Send> ThreadLocal<T> {
         }
         unsafe {
             // Read without atomic operations as only this thread can set the value.
-            let ptr = *bucket_ptr.add(thread.index).cast::<*const MaybeUninit<T>>();
+            let ptr = (&*bucket_ptr.add(thread.index).cast::<AtomicPtr<MaybeUninit<T>>>()).load(Ordering::Relaxed);
             if !ptr.is_null() {
                 Some(ptr.cast::<T>().as_ref().unwrap_unchecked())
             } else {

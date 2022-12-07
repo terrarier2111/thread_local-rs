@@ -117,6 +117,7 @@ cfg_if! {
                 // are the only one who can be accessing our `THREAD_HOLDER` and thus
                 // it's safe for us to access and drop it.
                 unsafe { THREAD_HOLDER.take(); }
+                println!("dropped guard!");
             }
         }
 

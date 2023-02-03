@@ -82,7 +82,7 @@ cfg_if! {
         #[thread_local]
         static mut THREAD: Option<Thread> = None;
 
-        thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard }; }
+        loom::thread_local! { static THREAD_GUARD: ThreadGuard = ThreadGuard; }
 
         impl Drop for ThreadGuard {
             fn drop(&mut self) {
@@ -132,8 +132,8 @@ cfg_if! {
         // thread is initialized without having to register a thread-local destructor.
         //
         // This makes the fast path smaller.
-        thread_local! { static THREAD: Cell<Option<Thread>> = const { Cell::new(None) }; }
-        thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard }; }
+        loom::thread_local! { static THREAD: Cell<Option<Thread>> = Cell::new(None); }
+        loom::thread_local! { static THREAD_GUARD: ThreadGuard = ThreadGuard; }
 
         /// Returns a thread ID for the current thread, allocating one if needed.
         #[inline]

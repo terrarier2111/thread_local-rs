@@ -6,7 +6,6 @@
 // copied, modified, or distributed except according to those terms.
 
 use crate::POINTER_WIDTH;
-use cfg_if::cfg_if;
 use once_cell::sync::Lazy;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -74,15 +73,18 @@ impl Thread {
     }
 }
 
-// Guard to ensure the thread ID is released on thread exit.
-struct ThreadGuard;
-
-cfg_if! {
+cfg_if::cfg_if! {
     if #[cfg(feature = "nightly")] {
+        // This is split into 2 thread-local variables so that we can check whether the
+        // thread is initialized without having to register a thread-local destructor.
+        //
+        // This makes the fast path smaller.
         #[thread_local]
         static mut THREAD: Option<Thread> = None;
-
         thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard }; }
+
+        // Guard to ensure the thread ID is released on thread exit.
+        struct ThreadGuard;
 
         impl Drop for ThreadGuard {
             fn drop(&mut self) {
@@ -95,74 +97,77 @@ cfg_if! {
             }
         }
 
+        /// Attempts to get the current thread if `get` has previously been
+        /// called.
         #[inline]
-        pub(crate) fn try_get_thread() -> Option<Thread> {
-            use std::mem::transmute;
-
-            // SAFETY: this is safe as the only two possibilities for updates
-            // are when this thread gets stopped or when the thread holder
-            // gets first set (which is no problem for this as it can't happen
-            // during this function call and after the clone we don't
-            // care about how the data we return is used)
-            // the transmute is safe because the only thing we are changing
-            // with it is the const generic parameter to a more restrictive
-            // one which is safe
-            unsafe { transmute(THREAD.clone()) }
+        pub(crate) fn try_get() -> Option<Thread> {
+            unsafe {
+                THREAD
+            }
         }
 
+        /// Returns a thread ID for the current thread, allocating one if needed.
         #[inline]
-        pub(crate) fn set_thread() {
-            // we have to initialize `THREAD_GUARD` in order for it to protect
-            // `THREAD_HOLDER` when it gets initialized
-            THREAD_GUARD.with(|_| {});
-            let thread = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc());
-            // SAFETY: this is safe because we know that there are no references
-            // to `THREAD` alive when this function gets called
-            // and thus we don't have to care about potential unsafety
-            // because of references, because there are none
-            // also the data is thread local which means that
-            // it's impossible for data races to occur
-            unsafe { THREAD = Some(thread); }
+        pub(crate) fn get() -> Thread {
+            if let Some(thread) = unsafe { THREAD } {
+                thread
+            } else {
+                #[cold]
+                fn new() -> Thread {
+                    let new = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc());
+                    unsafe {
+                        THREAD = Some(new);
+                    }
+                    THREAD_GUARD.with(|_| {});
+                    new
+                }
+                new()
+            }
         }
-
     } else {
-        use std::cell::Cell;
+        use std::cell::UnsafeCell;
 
         // This is split into 2 thread-local variables so that we can check whether the
         // thread is initialized without having to register a thread-local destructor.
         //
         // This makes the fast path smaller.
-        thread_local! { static THREAD: Cell<Option<Thread>> = const { Cell::new(None) }; }
+        thread_local! { static THREAD: UnsafeCell<Option<Thread>> = const { UnsafeCell::new(None) }; }
         thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard }; }
 
-        /// Returns a thread ID for the current thread, allocating one if needed.
-        #[inline]
-        pub(crate) fn get() -> Thread {
-            THREAD.with(|thread| {
-                if let Some(thread) = thread.get() {
-                    thread
-                } else {
-                    debug_assert!(thread.get().is_none());
-                    let new = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc());
-                    thread.set(Some(new));
-                    THREAD_GUARD.with(|_| {});
-                    new
-                }
-            })
+        // Guard to ensure the thread ID is released on thread exit.
+        struct ThreadGuard;
+
+        impl Drop for ThreadGuard {
+            fn drop(&mut self) {
+                let thread = THREAD.with(|thread| unsafe { &*thread.get() }).unwrap();
+                THREAD_ID_MANAGER.lock().unwrap().free(thread.id);
+            }
         }
 
         /// Attempts to get the current thread if `get` has previously been
         /// called.
         #[inline]
         pub(crate) fn try_get() -> Option<Thread> {
-            THREAD.with(|thread| thread.get())
+            *THREAD.with(|thread| unsafe { &*thread.get() })
         }
 
-        impl Drop for ThreadGuard {
-            fn drop(&mut self) {
-                let thread = THREAD.with(|thread| thread.get()).unwrap();
-                THREAD_ID_MANAGER.lock().unwrap().free(thread.id);
-            }
+        /// Returns a thread ID for the current thread, allocating one if needed.
+        #[inline]
+        pub(crate) fn get() -> Thread {
+            THREAD.with(|thread| {
+                if let Some(thread) = unsafe { &*thread.get() } {
+                    *thread
+                } else {
+                    #[cold]
+                    fn new(thread: &UnsafeCell<Option<Thread>>) -> Thread {
+                        let new = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc());
+                        unsafe { *thread.get() = Some(new); }
+                        THREAD_GUARD.with(|_| {});
+                        new
+                    }
+                    new(thread)
+                }
+            })
         }
     }
 }

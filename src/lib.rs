@@ -99,7 +99,7 @@ const BUCKETS: usize = (POINTER_WIDTH + 1) as usize;
 /// Thread-local variable wrapper
 ///
 /// See the [module-level documentation](index.html) for more.
-pub struct ThreadLocal<T: Send> {
+pub struct ThreadLocal<T> {
     /// The buckets in the thread local. The nth bucket contains `2^(n-1)`
     /// elements. Each bucket is lazily allocated.
     buckets: [AtomicPtr<Entry<T>>; BUCKETS],
@@ -133,7 +133,7 @@ impl<T: Send> Default for ThreadLocal<T> {
     }
 }
 
-impl<T: Send> Drop for ThreadLocal<T> {
+impl<T> Drop for ThreadLocal<T> {
     fn drop(&mut self) {
         let mut bucket_size = 1;
 

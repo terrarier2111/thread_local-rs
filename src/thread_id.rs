@@ -5,6 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use std::cell::UnsafeCell;
 use crate::POINTER_WIDTH;
 use once_cell::sync::Lazy;
 use std::cmp::Reverse;
@@ -112,12 +113,16 @@ cfg_if::cfg_if! {
             if let Some(thread) = unsafe { THREAD } {
                 thread
             } else {
-                let new = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc());
-                unsafe {
-                    THREAD = Some(new);
+                #[cold]
+                fn new() -> Thread {
+                    let new = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc());
+                    unsafe {
+                        THREAD = Some(new);
+                    }
+                    THREAD_GUARD.with(|_| {});
+                    new
                 }
-                THREAD_GUARD.with(|_| {});
-                new
+                new()
             }
         }
     } else {
@@ -127,7 +132,7 @@ cfg_if::cfg_if! {
         // thread is initialized without having to register a thread-local destructor.
         //
         // This makes the fast path smaller.
-        thread_local! { static THREAD: Cell<Option<Thread>> = const { Cell::new(None) }; }
+        thread_local! { static THREAD: UnsafeCell<Option<Thread>> = const { UnsafeCell::new(None) }; }
         thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard }; }
 
         // Guard to ensure the thread ID is released on thread exit.
@@ -135,7 +140,7 @@ cfg_if::cfg_if! {
 
         impl Drop for ThreadGuard {
             fn drop(&mut self) {
-                let thread = THREAD.with(|thread| thread.get()).unwrap();
+                let thread = THREAD.with(|thread| unsafe { &*thread.get() }).unwrap();
                 THREAD_ID_MANAGER.lock().unwrap().free(thread.id);
             }
         }
@@ -144,20 +149,24 @@ cfg_if::cfg_if! {
         /// called.
         #[inline]
         pub(crate) fn try_get() -> Option<Thread> {
-            THREAD.with(|thread| thread.get())
+            *THREAD.with(|thread| unsafe { &*thread.get() })
         }
 
         /// Returns a thread ID for the current thread, allocating one if needed.
         #[inline]
         pub(crate) fn get() -> Thread {
             THREAD.with(|thread| {
-                if let Some(thread) = thread.get() {
-                    thread
+                if let Some(thread) = unsafe { &*thread.get() } {
+                    *thread
                 } else {
-                    let new = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc());
-                    thread.set(Some(new));
-                    THREAD_GUARD.with(|_| {});
-                    new
+                    #[cold]
+                    fn new(thread: &UnsafeCell<Option<Thread>>) -> Thread {
+                        let new = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc());
+                        unsafe { *thread.get() = Some(new) };
+                        THREAD_GUARD.with(|_| {});
+                        new
+                    }
+                    new(thread)
                 }
             })
         }

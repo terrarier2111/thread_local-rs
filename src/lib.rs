@@ -560,7 +560,7 @@ unsafe fn deallocate_bucket<T, M: Metadata>(bucket: *mut Entry<T, M>, size: usiz
     let _ = Box::from_raw(std::slice::from_raw_parts_mut(bucket, size));
 }
 
-pub trait Metadata: Copy + Clone + Send + Sync + Default {
+pub trait Metadata: Send + Sync + Default {
 
     fn set_default(&self);
 

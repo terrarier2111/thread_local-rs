@@ -199,6 +199,11 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         self.get_inner_meta(thread_id::get())
     }
 
+    /// Returns the meta and value of the element for the current thread, if it exists.
+    pub fn get_val_and_meta(&self) -> Option<(&T, &M)> {
+        self.get_inner_val_and_meta(thread_id::get())
+    }
+
     /// Returns the element for the current thread, or creates it if it doesn't
     /// exist.
     pub fn get_or<F>(&self, create: F) -> &T
@@ -254,6 +259,23 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             // Read without atomic operations as only this thread can set the value.
             if (&entry.present as *const _ as *const bool).read() {
                 Some(&entry.meta)
+            } else {
+                None
+            }
+        }
+    }
+
+    fn get_inner_val_and_meta(&self, thread: Thread) -> Option<(&T, &M)> {
+        let bucket_ptr =
+            unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
+        if bucket_ptr.is_null() {
+            return None;
+        }
+        unsafe {
+            let entry = &*bucket_ptr.add(thread.index);
+            // Read without atomic operations as only this thread can set the value.
+            if (&entry.present as *const _ as *const bool).read() {
+                Some((&*(&*entry.value.get()).as_ptr(), &entry.meta))
             } else {
                 None
             }

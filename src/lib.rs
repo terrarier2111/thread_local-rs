@@ -115,6 +115,13 @@ struct Entry<T, M: Metadata = ()> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
+#[inline]
+pub const fn val_to_meta_byte_offset<T, M>() -> isize {
+    let val = memoffset::offset_of!(Entry::<T, M>, value) as isize;
+    let meta = memoffset::offset_of!(Entry::<T, M>, meta) as isize;
+    meta - val
+}
+
 impl<T, M: Metadata> Drop for Entry<T, M> {
     fn drop(&mut self) {
         unsafe {
@@ -432,6 +439,11 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
     /// threads are currently accessing their associated values.
     pub fn clear(&mut self) {
         *self = ThreadLocal::new();
+    }
+
+    #[inline]
+    pub const fn val_to_meta_offset() -> isize {
+        val_to_meta_byte_offset::<T, M>()
     }
 }
 

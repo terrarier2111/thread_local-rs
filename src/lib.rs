@@ -216,6 +216,19 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         }
     }
 
+    /// Returns the meta and value of the element for the current thread, or creates it if it doesn't
+    /// exist.
+    pub fn get_val_and_meta_or<F, MF>(&self, create: F, meta: MF) -> (&T, &M)
+        where
+            F: FnOnce() -> T,
+            MF: FnOnce(&M),
+    {
+        unsafe {
+            self.get_val_and_meta_or_try(|| Ok::<T, ()>(create()), meta)
+                .unchecked_unwrap_ok()
+        }
+    }
+
     /// Returns the element for the current thread, or creates it if it doesn't
     /// exist. If `create` fails, that error is returned and no element is
     /// added.
@@ -229,6 +242,22 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         }
 
         Ok(self.insert(create()?))
+    }
+
+    /// Returns the meta and value of the element for the current thread, or creates it if it doesn't
+    /// exist. If `create` fails, that error is returned and no element is
+    /// added.
+    pub fn get_val_and_meta_or_try<F, MF, E>(&self, create: F, meta: MF) -> Result<(&T, &M), E>
+        where
+            F: FnOnce() -> Result<T, E>,
+            MF: FnOnce(&M),
+    {
+        let thread = thread_id::get();
+        if let Some(val) = self.get_inner_val_and_meta(thread) {
+            return Ok(val);
+        }
+
+        Ok(self.insert_with_meta(create()?, meta))
     }
 
     fn get_inner(&self, thread: Thread) -> Option<&T> {
@@ -323,6 +352,49 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         self.values.fetch_add(1, Ordering::Release);
 
         unsafe { &*(&*value_ptr).as_ptr() }
+    }
+
+    #[cold]
+    fn insert_with_meta<F: FnOnce(&M)>(&self, data: T, f: F) -> (&T, &M) {
+        let thread = thread_id::get();
+        let bucket_atomic_ptr = unsafe { self.buckets.get_unchecked(thread.bucket) };
+        let bucket_ptr: *const _ = bucket_atomic_ptr.load(Ordering::Acquire);
+
+        // If the bucket doesn't already exist, we need to allocate it
+        let bucket_ptr = if bucket_ptr.is_null() {
+            let new_bucket = allocate_bucket(thread.bucket_size);
+
+            match bucket_atomic_ptr.compare_exchange(
+                ptr::null_mut(),
+                new_bucket,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => new_bucket,
+                // If the bucket value changed (from null), that means
+                // another thread stored a new bucket before we could,
+                // and we can free our bucket and use that one instead
+                Err(bucket_ptr) => {
+                    unsafe { deallocate_bucket(new_bucket, thread.bucket_size) }
+                    bucket_ptr
+                }
+            }
+        } else {
+            bucket_ptr
+        };
+
+        // Insert the new element into the bucket
+        let entry = unsafe { &*bucket_ptr.add(thread.index) };
+        let value_ptr = entry.value.get();
+        unsafe { value_ptr.write(MaybeUninit::new(data)) };
+        if size_of::<M>() > 0 {
+            f(&entry.meta);
+        }
+        entry.present.store(true, Ordering::Release);
+
+        self.values.fetch_add(1, Ordering::Release);
+
+        (unsafe { &*(&*value_ptr).as_ptr() }, &entry.meta)
     }
 
     /// Returns an iterator over the local values of all threads in unspecified

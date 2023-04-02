@@ -116,7 +116,7 @@ struct Entry<T, M: Metadata = ()> {
 }
 
 #[inline]
-pub const fn val_to_meta_byte_offset<T, M>() -> isize {
+pub fn val_to_meta_byte_offset<T, M: Metadata>() -> isize {
     let val = memoffset::offset_of!(Entry::<T, M>, value) as isize;
     let meta = memoffset::offset_of!(Entry::<T, M>, meta) as isize;
     meta - val
@@ -442,7 +442,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
     }
 
     #[inline]
-    pub const fn val_to_meta_offset() -> isize {
+    pub fn val_to_meta_offset() -> isize {
         val_to_meta_byte_offset::<T, M>()
     }
 }

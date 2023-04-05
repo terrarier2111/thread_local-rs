@@ -81,6 +81,7 @@ use std::mem;
 use std::mem::{MaybeUninit, size_of};
 use std::panic::UnwindSafe;
 use std::ptr;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use thread_id::Thread;
 use unreachable::UncheckedResultExt;
@@ -437,23 +438,23 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
     /// SAFETY: The provided `val` has to point to an instance of
     /// `T` that was returned by some call to this `ThreadLocal`.
     #[inline]
-    pub unsafe fn val_meta_ptr_from_val(val: *const T) -> ValMetaPtr<T, M> {
-        ValMetaPtr(val.cast::<u8>().offset(memoffset::offset_of!(Entry::<T, M>, value) as isize * -1).cast::<Entry<T, M>>())
+    pub unsafe fn val_meta_ptr_from_val(val: NonNull<T>) -> ValMetaPtr<T, M> {
+        ValMetaPtr(NonNull::new_unchecked(val.as_ptr().cast::<u8>().offset(memoffset::offset_of!(Entry::<T, M>, value) as isize * -1).cast::<Entry<T, M>>()))
     }
 }
 
-pub struct ValMetaPtr<T, M: Metadata>(*const Entry<T, M>);
+pub struct ValMetaPtr<T, M: Metadata>(NonNull<Entry<T, M>>);
 
 impl<T, M: Metadata> ValMetaPtr<T, M> {
 
     #[inline]
-    pub fn val_ptr(self) -> *const T {
-        unsafe { self.0.cast::<u8>().add(memoffset::offset_of!(Entry::<T, M>, value)).cast::<T>() }
+    pub fn val_ptr(self) -> NonNull<T> {
+        unsafe { NonNull::new_unchecked(self.0.as_ptr().cast::<u8>().add(memoffset::offset_of!(Entry::<T, M>, value)).cast::<T>()) }
     }
 
     #[inline]
-    pub fn meta_ptr(self) -> *const M {
-        unsafe { self.0.cast::<u8>().add(memoffset::offset_of!(Entry::<T, M>, meta)).cast::<T>() }
+    pub fn meta_ptr(self) -> NonNull<M> {
+        unsafe { NonNull::new_unchecked(self.0.as_ptr().cast::<u8>().add(memoffset::offset_of!(Entry::<T, M>, meta)).cast::<M>()) }
     }
 
 }

@@ -115,13 +115,6 @@ struct Entry<T, M: Metadata = ()> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
-#[inline]
-pub fn val_to_meta_byte_offset<T, M: Metadata>() -> isize {
-    let val = memoffset::offset_of!(Entry::<T, M>, value) as isize;
-    let meta = memoffset::offset_of!(Entry::<T, M>, meta) as isize;
-    meta - val
-}
-
 impl<T, M: Metadata> Drop for Entry<T, M> {
     fn drop(&mut self) {
         unsafe {
@@ -441,10 +434,28 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         *self = ThreadLocal::new();
     }
 
+    /// SAFETY: The provided `val` has to point to an instance of
+    /// `T` that was returned by some call to this `ThreadLocal`.
     #[inline]
-    pub fn val_to_meta_offset() -> isize {
-        val_to_meta_byte_offset::<T, M>()
+    pub unsafe fn val_meta_ptr_from_val(val: *const T) -> ValMetaPtr<T, M> {
+        ValMetaPtr(val.cast::<u8>().offset(memoffset::offset_of!(Entry::<T, M>, value) as isize * -1).cast::<Entry<T, M>>())
     }
+}
+
+pub struct ValMetaPtr<T, M: Metadata>(*const Entry<T, M>);
+
+impl<T, M: Metadata> ValMetaPtr<T, M> {
+
+    #[inline]
+    pub fn val_ptr(self) -> *const T {
+        unsafe { self.0.cast::<u8>().add(memoffset::offset_of!(Entry::<T, M>, value)).cast::<T>() }
+    }
+
+    #[inline]
+    pub fn meta_ptr(self) -> *const M {
+        unsafe { self.0.cast::<u8>().add(memoffset::offset_of!(Entry::<T, M>, meta)).cast::<T>() }
+    }
+
 }
 
 impl<T: Send, M: Metadata> IntoIterator for ThreadLocal<T, M> {

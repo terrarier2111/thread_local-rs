@@ -221,13 +221,15 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
     /// exist.
     pub fn get_val_and_meta_or<F, MF>(&self, create: F, meta: MF) -> (&T, &M)
         where
-            F: FnOnce() -> T,
+            F: FnOnce(*const M) -> T,
             MF: FnOnce(&M),
     {
-        unsafe {
-            self.get_val_and_meta_or_try(|| Ok::<T, ()>(create()), meta)
-                .unchecked_unwrap_ok()
+        let thread = thread_id::get();
+        if let Some(val) = self.get_inner_val_and_meta(thread) {
+            return val;
         }
+
+        self.insert_with_meta(create, meta)
     }
 
     /// Returns the element for the current thread, or creates it if it doesn't
@@ -243,22 +245,6 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         }
 
         Ok(self.insert(create()?))
-    }
-
-    /// Returns the meta and value of the element for the current thread, or creates it if it doesn't
-    /// exist. If `create` fails, that error is returned and no element is
-    /// added.
-    pub fn get_val_and_meta_or_try<F, MF, E>(&self, create: F, meta: MF) -> Result<(&T, &M), E>
-        where
-            F: FnOnce() -> Result<T, E>,
-            MF: FnOnce(&M),
-    {
-        let thread = thread_id::get();
-        if let Some(val) = self.get_inner_val_and_meta(thread) {
-            return Ok(val);
-        }
-
-        Ok(self.insert_with_meta(create()?, meta))
     }
 
     fn get_inner(&self, thread: Thread) -> Option<&T> {
@@ -356,7 +342,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
     }
 
     #[cold]
-    fn insert_with_meta<F: FnOnce(&M)>(&self, data: T, f: F) -> (&T, &M) {
+    fn insert_with_meta<F: FnOnce(*const M) -> T, FM: FnOnce(&M)>(&self, f: F, fm: FM) -> (&T, &M) {
         let thread = thread_id::get();
         let bucket_atomic_ptr = unsafe { self.buckets.get_unchecked(thread.bucket) };
         let bucket_ptr: *const _ = bucket_atomic_ptr.load(Ordering::Acquire);
@@ -387,9 +373,9 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         // Insert the new element into the bucket
         let entry = unsafe { &*bucket_ptr.add(thread.index) };
         let value_ptr = entry.value.get();
-        unsafe { value_ptr.write(MaybeUninit::new(data)) };
+        unsafe { value_ptr.write(MaybeUninit::new(f(&entry.meta as *const M))) };
         if size_of::<M>() > 0 {
-            f(&entry.meta);
+            fm(&entry.meta);
         }
         entry.present.store(true, Ordering::Release);
 

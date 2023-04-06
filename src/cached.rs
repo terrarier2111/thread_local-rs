@@ -1,10 +1,10 @@
 #![allow(deprecated)]
 
 use super::{IntoIter, IterMut, ThreadLocal};
+use crate::Metadata;
 use std::fmt;
 use std::panic::UnwindSafe;
 use std::usize;
-use crate::Metadata;
 
 /// Wrapper around [`ThreadLocal`].
 ///

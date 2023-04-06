@@ -411,6 +411,33 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         }
     }
 
+    /// Returns an iterator over the local values and metadata of all threads in unspecified
+    /// order.
+    ///
+    /// This call can be done safely, as `T` is required to implement [`Sync`].
+    pub fn iter_meta(&self) -> IterMeta<'_, T, M>
+        where
+            T: Sync,
+    {
+        IterMeta {
+            thread_local: self,
+            raw: RawIter::new(),
+        }
+    }
+
+    /// Returns a mutable iterator over the local values and metadata of all threads in
+    /// unspecified order.
+    ///
+    /// Since this call borrows the `ThreadLocal` mutably, this operation can
+    /// be done safely---the mutable borrow statically guarantees no other
+    /// threads are currently accessing their associated values.
+    pub fn iter_mut_meta(&mut self) -> IterMutMeta<T, M> {
+        IterMutMeta {
+            thread_local: self,
+            raw: RawIter::new(),
+        }
+    }
+
     /// Removes all thread-specific values from the `ThreadLocal`, effectively
     /// reseting it to its original state.
     ///
@@ -509,7 +536,7 @@ impl RawIter {
         }
     }
 
-    fn next<'a, T: Send + Sync, M: Metadata>(&mut self, thread_local: &'a ThreadLocal<T, M>) -> Option<&'a T> {
+    fn next<'a, T: Send + Sync, M: Metadata>(&mut self, thread_local: &'a ThreadLocal<T, M>) -> Option<&'a Entry<T, M>> {
         while self.bucket < BUCKETS {
             let bucket = unsafe { thread_local.buckets.get_unchecked(self.bucket) };
             let bucket = bucket.load(Ordering::Acquire);
@@ -520,7 +547,7 @@ impl RawIter {
                     self.index += 1;
                     if entry.present.load(Ordering::Acquire) {
                         self.yielded += 1;
-                        return Some(unsafe { &*(&*entry.value.get()).as_ptr() });
+                        return Some(entry);
                     }
                 }
             }
@@ -529,10 +556,10 @@ impl RawIter {
         }
         None
     }
-    fn next_mut<'a, T: Send, M: Metadata>(
+    fn next_mut<T: Send, M: Metadata>(
         &mut self,
-        thread_local: &'a mut ThreadLocal<T, M>,
-    ) -> Option<&'a mut Entry<T, M>> {
+        thread_local: &mut ThreadLocal<T, M>,
+    ) -> Option<*mut Entry<T, M>> {
         if *thread_local.values.get_mut() == self.yielded {
             return None;
         }
@@ -547,7 +574,7 @@ impl RawIter {
                     self.index += 1;
                     if *entry.present.get_mut() {
                         self.yielded += 1;
-                        return Some(entry);
+                        return Some(entry as *mut Entry<T, M>);
                     }
                 }
             }
@@ -586,7 +613,7 @@ pub struct Iter<'a, T: Send + Sync, M: Metadata = ()> {
 impl<'a, T: Send + Sync, M: Metadata> Iterator for Iter<'a, T, M> {
     type Item = &'a T;
     fn next(&mut self) -> Option<Self::Item> {
-        self.raw.next(self.thread_local)
+        self.raw.next(self.thread_local).map(|entry| unsafe { &*(&*entry.value.get()).as_ptr() })
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.raw.size_hint(self.thread_local)
@@ -605,7 +632,7 @@ impl<'a, T: Send, M: Metadata> Iterator for IterMut<'a, T, M> {
     fn next(&mut self) -> Option<&'a mut T> {
         self.raw
             .next_mut(self.thread_local)
-            .map(|entry| unsafe { &mut *(&mut *entry.value.get()).as_mut_ptr() })
+            .map(|entry| unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() })
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.raw.size_hint_frozen(self.thread_local)
@@ -634,9 +661,9 @@ impl<T: Send, M: Metadata> Iterator for IntoIter<T, M> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
         self.raw.next_mut(&mut self.thread_local).map(|entry| {
-            *entry.present.get_mut() = false;
+            unsafe { *(&mut *entry).present.get_mut() = false; }
             unsafe {
-                mem::replace(&mut *entry.value.get(), MaybeUninit::uninit()).assume_init()
+                mem::replace(&mut *(&mut *entry).value.get(), MaybeUninit::uninit()).assume_init()
             }
         })
     }
@@ -647,6 +674,53 @@ impl<T: Send, M: Metadata> Iterator for IntoIter<T, M> {
 
 impl<T: Send, M: Metadata> ExactSizeIterator for IntoIter<T, M> {}
 impl<T: Send, M: Metadata> FusedIterator for IntoIter<T, M> {}
+
+/// Iterator over the contents of a `ThreadLocal`.
+#[derive(Debug)]
+pub struct IterMeta<'a, T: Send + Sync, M: Metadata = ()> {
+    thread_local: &'a ThreadLocal<T, M>,
+    raw: RawIter,
+}
+
+impl<'a, T: Send + Sync, M: Metadata> Iterator for IterMeta<'a, T, M> {
+    type Item = (&'a T, &'a M);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.raw.next(self.thread_local).map(|entry| (unsafe { &*(&*entry.value.get()).as_ptr() }, &entry.meta))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.raw.size_hint(self.thread_local)
+    }
+}
+impl<T: Send + Sync, M: Metadata> FusedIterator for IterMeta<'_, T, M> {}
+
+/// Mutable iterator over the contents of a `ThreadLocal`.
+pub struct IterMutMeta<'a, T: Send, M: Metadata = ()> {
+    thread_local: &'a mut ThreadLocal<T, M>,
+    raw: RawIter,
+}
+
+impl<'a, T: Send, M: Metadata> Iterator for IterMutMeta<'a, T, M> {
+    type Item = (&'a mut T, &'a M);
+    fn next(&mut self) -> Option<(&'a mut T, &'a M)> {
+        self.raw
+            .next_mut(self.thread_local)
+            .map(move |entry| (unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() }, unsafe { &(&*entry).meta }))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.raw.size_hint_frozen(self.thread_local)
+    }
+}
+
+impl<T: Send, M: Metadata> ExactSizeIterator for IterMutMeta<'_, T, M> {}
+impl<T: Send, M: Metadata> FusedIterator for IterMutMeta<'_, T, M> {}
+
+// Manual impl so we don't call Debug on the ThreadLocal, as doing so would create a reference to
+// this thread's value that potentially aliases with a mutable reference we have given out.
+impl<'a, T: Send + fmt::Debug, M: Metadata> fmt::Debug for IterMutMeta<'a, T, M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IterMutMeta").field("raw", &self.raw).finish()
+    }
+}
 
 fn allocate_bucket<T, M: Metadata>(size: usize) -> *mut Entry<T, M> {
     Box::into_raw(

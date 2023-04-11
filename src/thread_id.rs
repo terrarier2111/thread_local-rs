@@ -124,14 +124,14 @@ cfg_if::cfg_if! {
         // This makes the fast path smaller.
         #[thread_local]
         static mut THREAD: Option<Thread> = None;
-        thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard { id: UnsafeCell::new(0) } }; }
+        thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard { id: Cell::new(0) } }; }
 
         // Guard to ensure the thread ID is released on thread exit.
         struct ThreadGuard {
             // We keep a copy of the thread ID in the ThreadGuard: we can't
             // reliably access THREAD in our Drop impl due to the unpredictable
             // order of TLS destructors.
-            id: UnsafeCell<usize>,
+            id: Cell<usize>,
         }
 
         impl Drop for ThreadGuard {
@@ -142,7 +142,7 @@ cfg_if::cfg_if! {
                 unsafe {
                     THREAD = None;
                 }
-                THREAD_ID_MANAGER.lock().unwrap().free(unsafe { *self.id.get() });
+                THREAD_ID_MANAGER.lock().unwrap().free(self.id.get());
             }
         }
 
@@ -173,14 +173,14 @@ cfg_if::cfg_if! {
         //
         // This makes the fast path smaller.
         thread_local! { static THREAD: UnsafeCell<Option<Thread>> = const { UnsafeCell::new(None) }; }
-        thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard { id: UnsafeCell::new(0) } }; }
+        thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard { id: Cell::new(0) } }; }
 
         // Guard to ensure the thread ID is released on thread exit.
         struct ThreadGuard {
             // We keep a copy of the thread ID in the ThreadGuard: we can't
             // reliably access THREAD in our Drop impl due to the unpredictable
             // order of TLS destructors.
-            id: UnsafeCell<usize>,
+            id: Cell<usize>,
         }
 
         impl Drop for ThreadGuard {
@@ -191,7 +191,7 @@ cfg_if::cfg_if! {
                 let _ = THREAD.try_with(|thread| {
                     *unsafe { &mut *thread.get() } = None;
                 });
-                THREAD_ID_MANAGER.lock().unwrap().free(unsafe { *self.id.get() });
+                THREAD_ID_MANAGER.lock().unwrap().free(self.id.get());
             }
         }
 
@@ -216,7 +216,7 @@ cfg_if::cfg_if! {
             *unsafe { &mut *thread.get() } = Some(new);
             let new = unsafe { (&*thread.get()).as_ref().unwrap_unchecked() };
             THREAD_GUARD.with(|guard| {
-                *unsafe { &mut *guard.id.get() } = new.id;
+                guard.id.set(new.id);
             });
             new
         }

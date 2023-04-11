@@ -5,11 +5,13 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use crate::POINTER_WIDTH;
+use crate::{INVALID_THREAD_ID, POINTER_WIDTH};
 use once_cell::sync::Lazy;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::process::abort;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::usize;
 
@@ -21,8 +23,8 @@ struct ThreadIdManager {
     free_list: BinaryHeap<Reverse<usize>>,
 }
 impl ThreadIdManager {
-    fn new() -> ThreadIdManager {
-        ThreadIdManager {
+    fn new() -> Self {
+        Self {
             free_from: 0,
             free_list: BinaryHeap::new(),
         }
@@ -46,9 +48,18 @@ impl ThreadIdManager {
 static THREAD_ID_MANAGER: Lazy<Mutex<ThreadIdManager>> =
     Lazy::new(|| Mutex::new(ThreadIdManager::new()));
 
+fn thread_id() -> usize {
+    let tid = thread_id::get();
+
+    if tid == INVALID_THREAD_ID {
+        abort();
+    }
+
+    tid
+}
+
 /// Data which is unique to the current thread while it is running.
 /// A thread ID may be reused after a thread exits.
-#[derive(Clone, Copy)]
 pub(crate) struct Thread {
     /// The thread ID obtained from the thread ID manager.
     pub(crate) id: usize,
@@ -58,7 +69,35 @@ pub(crate) struct Thread {
     pub(crate) bucket_size: usize,
     /// The index into the bucket this thread's local storage is in.
     pub(crate) index: usize,
+    pub(crate) true_id: usize,
+    pub(crate) dropping: AtomicBool,
+    pub(crate) free_list: Mutex<HashMap<usize, EntryData>>,
 }
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        self.dropping.store(true, Ordering::Release);
+        let mut free_list = self.free_list.lock();
+        for entry in free_list.unwrap().iter() {
+            entry.1.cleanup(*entry.0 as *const ());
+        }
+    }
+}
+
+pub(crate) struct EntryData {
+    pub(crate) drop_fn: unsafe fn(*const ()),
+}
+
+impl EntryData {
+
+    #[inline]
+    fn cleanup(&self, data: *const ()) {
+        let dfn = self.drop_fn;
+        unsafe { dfn(data) };
+    }
+
+}
+
 impl Thread {
     fn new(id: usize) -> Thread {
         let bucket = usize::from(POINTER_WIDTH) - id.leading_zeros() as usize;
@@ -70,6 +109,9 @@ impl Thread {
             bucket,
             bucket_size,
             index,
+            true_id: thread_id(),
+            dropping: Default::default(),
+            free_list: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -82,14 +124,14 @@ cfg_if::cfg_if! {
         // This makes the fast path smaller.
         #[thread_local]
         static mut THREAD: Option<Thread> = None;
-        thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard { id: Cell::new(0) } }; }
+        thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard { id: UnsafeCell::new(0) } }; }
 
         // Guard to ensure the thread ID is released on thread exit.
         struct ThreadGuard {
             // We keep a copy of the thread ID in the ThreadGuard: we can't
             // reliably access THREAD in our Drop impl due to the unpredictable
             // order of TLS destructors.
-            id: Cell<usize>,
+            id: UnsafeCell<usize>,
         }
 
         impl Drop for ThreadGuard {
@@ -100,14 +142,14 @@ cfg_if::cfg_if! {
                 unsafe {
                     THREAD = None;
                 }
-                THREAD_ID_MANAGER.lock().unwrap().free(self.id.get());
+                THREAD_ID_MANAGER.lock().unwrap().free(unsafe { *self.id.get() });
             }
         }
 
         /// Returns a thread ID for the current thread, allocating one if needed.
         #[inline]
-        pub(crate) fn get() -> Thread {
-            if let Some(thread) = unsafe { THREAD } {
+        pub(crate) fn get() -> &Thread {
+            if let Some(thread) = unsafe { THREAD }.as_ref() {
                 thread
             } else {
                 get_slow()
@@ -116,11 +158,12 @@ cfg_if::cfg_if! {
 
         /// Out-of-line slow path for allocating a thread ID.
         #[cold]
-         fn get_slow() -> Thread {
+         fn get_slow() -> &Thread {
             let new = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc());
             unsafe {
                 THREAD = Some(new);
             }
+            let new = THREAD.as_ref().unwrap_unchecked();
             THREAD_GUARD.with(|guard| guard.id.set(new.id));
             new
         }
@@ -129,15 +172,15 @@ cfg_if::cfg_if! {
         // thread is initialized without having to register a thread-local destructor.
         //
         // This makes the fast path smaller.
-        thread_local! { static THREAD: Cell<Option<Thread>> = const { Cell::new(None) }; }
-        thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard { id: Cell::new(0) } }; }
+        thread_local! { static THREAD: UnsafeCell<Option<Thread>> = const { UnsafeCell::new(None) }; }
+        thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard { id: UnsafeCell::new(0) } }; }
 
         // Guard to ensure the thread ID is released on thread exit.
         struct ThreadGuard {
             // We keep a copy of the thread ID in the ThreadGuard: we can't
             // reliably access THREAD in our Drop impl due to the unpredictable
             // order of TLS destructors.
-            id: Cell<usize>,
+            id: UnsafeCell<usize>,
         }
 
         impl Drop for ThreadGuard {
@@ -145,29 +188,36 @@ cfg_if::cfg_if! {
                 // Release the thread ID. Any further accesses to the thread ID
                 // will go through get_slow which will either panic or
                 // initialize a new ThreadGuard.
-                let _ = THREAD.try_with(|thread| thread.set(None));
-                THREAD_ID_MANAGER.lock().unwrap().free(self.id.get());
+                let _ = THREAD.try_with(|thread| {
+                    *unsafe { &mut *thread.get() } = None;
+                });
+                THREAD_ID_MANAGER.lock().unwrap().free(unsafe { *self.id.get() });
             }
         }
 
         /// Returns a thread ID for the current thread, allocating one if needed.
         #[inline]
-        pub(crate) fn get() -> Thread {
-            THREAD.with(|thread| {
-                if let Some(thread) = thread.get() {
-                    thread
-                } else {
-                    get_slow(thread)
-                }
-            })
+        pub(crate) fn get<'a>() -> &'a Thread {
+            unsafe {
+                THREAD.with(|thread| {
+                    if let Some(thread) = unsafe { &*thread.get() } {
+                        thread as *const Thread
+                    } else {
+                        get_slow(thread) as *const Thread
+                    }
+                }).as_ref().unwrap_unchecked()
+            }
         }
 
         /// Out-of-line slow path for allocating a thread ID.
         #[cold]
-        fn get_slow(thread: &Cell<Option<Thread>>) -> Thread {
+        fn get_slow(thread: &UnsafeCell<Option<Thread>>) -> &Thread {
             let new = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc());
-            thread.set(Some(new));
-            THREAD_GUARD.with(|guard| guard.id.set(new.id));
+            *unsafe { &mut *thread.get() } = Some(new);
+            let new = unsafe { (&*thread.get()).as_ref().unwrap_unchecked() };
+            THREAD_GUARD.with(|guard| {
+                *unsafe { &mut *guard.id.get() } = new.id;
+            });
             new
         }
     }

@@ -78,12 +78,14 @@ use std::cell::UnsafeCell;
 use std::fmt;
 use std::iter::FusedIterator;
 use std::mem;
-use std::mem::{MaybeUninit, size_of};
+use std::mem::{MaybeUninit, size_of, transmute};
 use std::panic::UnwindSafe;
 use std::ptr;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use thread_id::Thread;
+use std::ptr::{NonNull, null_mut};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::TryLockResult;
+use crossbeam_utils::Backoff;
+use crate::thread_id::Thread;
 use unreachable::UncheckedResultExt;
 
 // Use usize::BITS once it has stabilized and the MSRV has been bumped.
@@ -105,26 +107,118 @@ pub struct ThreadLocal<T: Send, M: Metadata = ()> {
     /// elements. Each bucket is lazily allocated.
     buckets: [AtomicPtr<Entry<T, M>>; BUCKETS],
 
+    alternative_buckets: [AtomicPtr<Entry<T, M>>; BUCKETS],
+
     /// The number of values in the thread local. This can be less than the real number of values,
     /// but is never more.
     values: AtomicUsize,
 }
 
+const INVALID_THREAD_ID: usize = usize::MAX;
+
+// there is nothing to guard, so the guard can't be used
+const GUARD_EMPTY: usize = 0;
+// the guard is ready to be used (changed to active/empty)
+const GUARD_READY: usize = 1;
+// the guard is currently active and anybody wanting to use it has to wait
+const GUARD_ACTIVE: usize = 2;
+
+// FIXME: add a guard either to the central struct or to the entries
+
 struct Entry<T, M: Metadata = ()> {
-    present: AtomicBool,
+    tid: AtomicUsize, // FIXME: do we even need this with `thread` and `guard`?
+    guard: AtomicUsize,
+    alternative_entry: AtomicPtr<Entry<T, M>>,
+    thread: AtomicPtr<Thread>,
     meta: M,
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
-impl<T, M: Metadata> Drop for Entry<T, M> {
-    fn drop(&mut self) {
-        unsafe {
-            if *self.present.get_mut() {
-                ptr::drop_in_place((*self.value.get()).as_mut_ptr());
+impl<T, M: Metadata> Entry<T, M> {
+
+    /// This should only be called when the central `ThreadLocal`
+    /// struct gets dropped.
+    pub(crate) unsafe fn try_detach_thread(&self) {
+        let alt = self.alternative_entry.load(Ordering::Acquire);
+
+        if let Some(alt) = alt.as_ref() {
+            alt.try_detach_thread_locally();
+        }
+
+        self.try_detach_thread_locally();
+    }
+
+    pub(crate) unsafe fn try_detach_thread_locally(&self) {
+        // the entry is either empty or the guard is currently active
+        if self.guard.load(Ordering::Acquire) != GUARD_READY ||
+            self.guard.compare_exchange(GUARD_READY, GUARD_ACTIVE, Ordering::Release, Ordering::Relaxed).is_err() {
+            return;
+        }
+
+        // FIXME: this probably isn't necessary as we already checked whether this entry is
+        // FIXME: active by checking `guard`
+        /*
+        let tid = self.tid.load(Ordering::Acquire);
+        if tid == INVALID_THREAD_ID {
+            self.guard.store(GUARD_EMPTY, Ordering::Release);
+            return;
+        }*/
+
+        let thread = self.thread.load(Ordering::Acquire);
+
+        let mut backoff = Backoff::new();
+        loop {
+            match unsafe { &*thread }.free_list.try_lock() {
+                Ok(mut guard) => {
+                    guard.remove(&(self as *const Entry<T, M> as usize));
+                    return;
+                }
+                Err(_) => {
+                    // check if the thread declared that it was dropping, if so give up.
+                    if unsafe { &*thread }.dropping.load(Ordering::Acquire) {
+                        self.guard.store(GUARD_READY, Ordering::Release);
+                        return;
+                    }
+
+                    // FIXME: do we have a better way to wait (but be able to see a change in dropping)
+                    backoff.snooze();
+                }
             }
         }
     }
+
+    pub(crate) unsafe fn cleanup(slf: *const Self) {
+        let slf = unsafe { &*slf };
+        let mut backoff = Backoff::new();
+        while slf.guard.compare_exchange_weak(GUARD_READY, GUARD_ACTIVE, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            backoff.snooze();
+        }
+        // clean up the value as we already know at this point that there is a value present
+        unsafe { ptr::drop_in_place(slf.value.get()); }
+        // signal that there is no thread associated with the entry anymore.
+        slf.tid.store(INVALID_THREAD_ID, Ordering::Release);
+    }
 }
+
+impl<T, M: Metadata> Drop for Entry<T, M> {
+    fn drop(&mut self) {
+        if *self.tid.get_mut() != INVALID_THREAD_ID {
+            unsafe { ptr::drop_in_place((*self.value.get()).as_mut_ptr()); }
+        }
+        // FIXME: clean up all alternative entries at the central struct, so we don't have to
+        // FIXME: do it here, locally.
+        /*let alt = self.alternative_entry.load(Ordering::Acquire);
+        if !alt.is_null() {
+            unsafe { ptr::drop_in_place(alt); }
+        }*/
+    }
+}
+
+/*pub trait TryDrop: Sized {
+
+    unsafe fn try_drop(self: &UnsafeCell<MaybeUninit<Self>>) -> bool;
+
+}*/
 
 // ThreadLocal is always Sync, even if T isn't
 unsafe impl<T: Send, M: Metadata> Sync for ThreadLocal<T, M> {}
@@ -172,9 +266,19 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             .map(|c| usize::from(POINTER_WIDTH) - (c.leading_zeros() as usize) + 1)
             .unwrap_or(0);
 
-        let mut buckets = [ptr::null_mut(); BUCKETS];
+        let mut buckets = [null_mut(); BUCKETS];
         let mut bucket_size = 1;
         for (i, bucket) in buckets[..allocated_buckets].iter_mut().enumerate() {
+            *bucket = allocate_bucket::<T, M>(bucket_size);
+
+            if i != 0 {
+                bucket_size <<= 1;
+            }
+        }
+
+        let mut alternative_buckets = [null_mut(); BUCKETS];
+        let mut bucket_size = 1;
+        for (i, bucket) in alternative_buckets[..allocated_buckets].iter_mut().enumerate() {
             *bucket = allocate_bucket::<T, M>(bucket_size);
 
             if i != 0 {
@@ -185,7 +289,8 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         ThreadLocal {
             // Safety: AtomicPtr has the same representation as a pointer and arrays have the same
             // representation as a sequence of their inner type.
-            buckets: unsafe { mem::transmute(buckets) },
+            buckets: unsafe { transmute(buckets) },
+            alternative_buckets: unsafe { transmute(alternative_buckets) },
             values: AtomicUsize::new(0),
         }
     }
@@ -247,7 +352,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         Ok(self.insert(create()?))
     }
 
-    fn get_inner(&self, thread: Thread) -> Option<&T> {
+    fn get_inner(&self, thread: &Thread) -> Option<&T> {
         let bucket_ptr =
             unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
         if bucket_ptr.is_null() {
@@ -256,7 +361,8 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         unsafe {
             let entry = &*bucket_ptr.add(thread.index);
             // Read without atomic operations as only this thread can set the value.
-            if (&entry.present as *const _ as *const bool).read() {
+            let tid = entry.tid.load(Ordering::Acquire);
+            if tid == thread.true_id {
                 Some(&*(&*entry.value.get()).as_ptr())
             } else {
                 None
@@ -264,7 +370,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         }
     }
 
-    fn get_inner_meta(&self, thread: Thread) -> Option<&M> {
+    fn get_inner_meta(&self, thread: &Thread) -> Option<&M> {
         let bucket_ptr =
             unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
         if bucket_ptr.is_null() {
@@ -273,7 +379,8 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         unsafe {
             let entry = &*bucket_ptr.add(thread.index);
             // Read without atomic operations as only this thread can set the value.
-            if (&entry.present as *const _ as *const bool).read() {
+            let tid = entry.tid.load(Ordering::Acquire);
+            if tid == thread.true_id {
                 Some(&entry.meta)
             } else {
                 None
@@ -281,7 +388,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         }
     }
 
-    fn get_inner_val_and_meta(&self, thread: Thread) -> Option<(&T, &M)> {
+    fn get_inner_val_and_meta(&self, thread: &Thread) -> Option<(&T, &M)> {
         let bucket_ptr =
             unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
         if bucket_ptr.is_null() {
@@ -290,7 +397,8 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         unsafe {
             let entry = &*bucket_ptr.add(thread.index);
             // Read without atomic operations as only this thread can set the value.
-            if (&entry.present as *const _ as *const bool).read() {
+            let tid = entry.tid.load(Ordering::Acquire);
+            if tid == thread.true_id {
                 Some((&*(&*entry.value.get()).as_ptr(), &entry.meta))
             } else {
                 None
@@ -334,7 +442,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         if size_of::<M>() > 0 {
             entry.meta.set_default();
         }
-        entry.present.store(true, Ordering::Release);
+        entry.tid.store(thread.true_id, Ordering::Release);
 
         self.values.fetch_add(1, Ordering::Release);
 
@@ -377,7 +485,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         if size_of::<M>() > 0 {
             fm(&entry.meta);
         }
-        entry.present.store(true, Ordering::Release);
+        entry.tid.store(thread.true_id, Ordering::Release);
 
         self.values.fetch_add(1, Ordering::Release);
 
@@ -545,7 +653,7 @@ impl RawIter {
                 while self.index < self.bucket_size {
                     let entry = unsafe { &*bucket.add(self.index) };
                     self.index += 1;
-                    if entry.present.load(Ordering::Acquire) {
+                    if entry.tid.load(Ordering::Acquire) != INVALID_THREAD_ID {
                         self.yielded += 1;
                         return Some(entry);
                     }
@@ -570,11 +678,11 @@ impl RawIter {
 
             if !bucket.is_null() {
                 while self.index < self.bucket_size {
-                    let entry = unsafe { &mut *bucket.add(self.index) };
+                    let entry = unsafe { &*bucket.add(self.index) };
                     self.index += 1;
-                    if *entry.present.get_mut() {
+                    if entry.tid.load(Ordering::Acquire) != INVALID_THREAD_ID {
                         self.yielded += 1;
-                        return Some(entry as *mut Entry<T, M>);
+                        return Some((entry as *const Entry<T, M>).cast_mut());
                     }
                 }
             }
@@ -661,7 +769,7 @@ impl<T: Send, M: Metadata> Iterator for IntoIter<T, M> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
         self.raw.next_mut(&mut self.thread_local).map(|entry| {
-            unsafe { *(&mut *entry).present.get_mut() = false; }
+            unsafe { *(&mut *entry).tid.get_mut() = INVALID_THREAD_ID; }
             unsafe {
                 mem::replace(&mut *(&mut *entry).value.get(), MaybeUninit::uninit()).assume_init()
             }
@@ -726,7 +834,10 @@ fn allocate_bucket<T, M: Metadata>(size: usize) -> *mut Entry<T, M> {
     Box::into_raw(
         (0..size)
             .map(|_| Entry::<T, M> {
-                present: AtomicBool::new(false),
+                tid: AtomicUsize::new(INVALID_THREAD_ID),
+                guard: Default::default(),
+                alternative_entry: AtomicPtr::new(null_mut()),
+                thread: Default::default(),
                 meta: Default::default(),
                 value: UnsafeCell::new(MaybeUninit::uninit()),
             })

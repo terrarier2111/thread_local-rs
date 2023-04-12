@@ -65,7 +65,7 @@
 
 #![warn(missing_docs)]
 #![allow(clippy::mutex_atomic)]
-#![cfg_attr(feature = "nightly", feature(thread_local))]
+#![feature(thread_local)]
 
 mod cached;
 mod thread_id;
@@ -85,7 +85,7 @@ use std::ptr::{NonNull, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::TryLockResult;
 use crossbeam_utils::Backoff;
-use crate::thread_id::Thread;
+use crate::thread_id::{FreeList, Thread};
 use unreachable::UncheckedResultExt;
 
 // Use usize::BITS once it has stabilized and the MSRV has been bumped.
@@ -129,7 +129,7 @@ struct Entry<T, M: Metadata = ()> {
     tid: AtomicUsize, // FIXME: do we even need this with `thread` and `guard`?
     guard: AtomicUsize,
     alternative_entry: AtomicPtr<Entry<T, M>>,
-    thread: AtomicPtr<Thread>,
+    free_list: AtomicPtr<FreeList>,
     meta: M,
     value: UnsafeCell<MaybeUninit<T>>,
 }
@@ -164,18 +164,18 @@ impl<T, M: Metadata> Entry<T, M> {
             return;
         }*/
 
-        let thread = self.thread.load(Ordering::Acquire);
+        let free_list = self.free_list.load(Ordering::Acquire);
 
         let mut backoff = Backoff::new();
         loop {
-            match unsafe { &*thread }.free_list.try_lock() {
+            match unsafe { &*free_list }.free_list.try_lock() {
                 Ok(mut guard) => {
                     guard.remove(&(self as *const Entry<T, M> as usize));
                     return;
                 }
                 Err(_) => {
                     // check if the thread declared that it was dropping, if so give up.
-                    if unsafe { &*thread }.dropping.load(Ordering::Acquire) {
+                    if unsafe { &*free_list }.dropping.load(Ordering::Acquire) {
                         self.guard.store(GUARD_READY, Ordering::Release);
                         return;
                     }
@@ -244,6 +244,13 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
 
             if bucket_ptr.is_null() {
                 continue;
+            }
+
+            // FIXME: use a stacklocal vec to capture all unfinished entries and iterate over them after trying to
+            // FIXME: detach all threads once in order to ensure dropping is valid!
+            for offset in 0..this_bucket_size {
+                let entry = unsafe { bucket_ptr.add(offset).as_ref().unwrap_unchecked() };
+                unsafe { entry.try_detach_thread(); }
             }
 
             unsafe { deallocate_bucket(bucket_ptr, this_bucket_size) };
@@ -352,7 +359,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         Ok(self.insert(create()?))
     }
 
-    fn get_inner(&self, thread: &Thread) -> Option<&T> {
+    fn get_inner(&self, thread: Thread) -> Option<&T> {
         let bucket_ptr =
             unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
         if bucket_ptr.is_null() {
@@ -361,8 +368,8 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         unsafe {
             let entry = &*bucket_ptr.add(thread.index);
             // Read without atomic operations as only this thread can set the value.
-            let tid = entry.tid.load(Ordering::Acquire);
-            if tid == thread.true_id {
+            let free_list = entry.free_list.load(Ordering::Acquire);
+            if free_list.cast_const() == thread.free_list {
                 Some(&*(&*entry.value.get()).as_ptr())
             } else {
                 None
@@ -370,7 +377,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         }
     }
 
-    fn get_inner_meta(&self, thread: &Thread) -> Option<&M> {
+    fn get_inner_meta(&self, thread: Thread) -> Option<&M> {
         let bucket_ptr =
             unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
         if bucket_ptr.is_null() {
@@ -379,8 +386,8 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         unsafe {
             let entry = &*bucket_ptr.add(thread.index);
             // Read without atomic operations as only this thread can set the value.
-            let tid = entry.tid.load(Ordering::Acquire);
-            if tid == thread.true_id {
+            let free_list = entry.free_list.load(Ordering::Acquire);
+            if free_list.cast_const() == thread.free_list {
                 Some(&entry.meta)
             } else {
                 None
@@ -388,7 +395,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         }
     }
 
-    fn get_inner_val_and_meta(&self, thread: &Thread) -> Option<(&T, &M)> {
+    fn get_inner_val_and_meta(&self, thread: Thread) -> Option<(&T, &M)> {
         let bucket_ptr =
             unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
         if bucket_ptr.is_null() {
@@ -397,8 +404,8 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         unsafe {
             let entry = &*bucket_ptr.add(thread.index);
             // Read without atomic operations as only this thread can set the value.
-            let tid = entry.tid.load(Ordering::Acquire);
-            if tid == thread.true_id {
+            let free_list = entry.free_list.load(Ordering::Acquire);
+            if free_list.cast_const() == thread.free_list {
                 Some((&*(&*entry.value.get()).as_ptr(), &entry.meta))
             } else {
                 None
@@ -414,10 +421,10 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket(thread.bucket_size);
+            let new_bucket = allocate_bucket(thread.bucket_size());
 
             match bucket_atomic_ptr.compare_exchange(
-                ptr::null_mut(),
+                null_mut(),
                 new_bucket,
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -427,7 +434,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
                 // another thread stored a new bucket before we could,
                 // and we can free our bucket and use that one instead
                 Err(bucket_ptr) => {
-                    unsafe { deallocate_bucket(new_bucket, thread.bucket_size) }
+                    unsafe { deallocate_bucket(new_bucket, thread.bucket_size()) }
                     bucket_ptr
                 }
             }
@@ -442,7 +449,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         if size_of::<M>() > 0 {
             entry.meta.set_default();
         }
-        entry.tid.store(thread.true_id, Ordering::Release);
+        entry.free_list.store(thread.free_list.cast_mut(), Ordering::Release);
 
         self.values.fetch_add(1, Ordering::Release);
 
@@ -457,10 +464,10 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket(thread.bucket_size);
+            let new_bucket = allocate_bucket(thread.bucket_size());
 
             match bucket_atomic_ptr.compare_exchange(
-                ptr::null_mut(),
+                null_mut(),
                 new_bucket,
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -470,7 +477,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
                 // another thread stored a new bucket before we could,
                 // and we can free our bucket and use that one instead
                 Err(bucket_ptr) => {
-                    unsafe { deallocate_bucket(new_bucket, thread.bucket_size) }
+                    unsafe { deallocate_bucket(new_bucket, thread.bucket_size()) }
                     bucket_ptr
                 }
             }
@@ -485,7 +492,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         if size_of::<M>() > 0 {
             fm(&entry.meta);
         }
-        entry.tid.store(thread.true_id, Ordering::Release);
+        entry.free_list.store(thread.free_list.cast_mut(), Ordering::Release);
 
         self.values.fetch_add(1, Ordering::Release);
 
@@ -837,7 +844,7 @@ fn allocate_bucket<T, M: Metadata>(size: usize) -> *mut Entry<T, M> {
                 tid: AtomicUsize::new(INVALID_THREAD_ID),
                 guard: Default::default(),
                 alternative_entry: AtomicPtr::new(null_mut()),
-                thread: Default::default(),
+                free_list: Default::default(),
                 meta: Default::default(),
                 value: UnsafeCell::new(MaybeUninit::uninit()),
             })

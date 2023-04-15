@@ -85,6 +85,7 @@ use std::ptr::{NonNull, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::TryLockResult;
 use crossbeam_utils::Backoff;
+use smallvec::{smallvec, SmallVec};
 use crate::thread_id::{FreeList, Thread};
 use unreachable::UncheckedResultExt;
 
@@ -123,10 +124,8 @@ const GUARD_READY: usize = 1;
 // the guard is currently active and anybody wanting to use it has to wait
 const GUARD_ACTIVE: usize = 2;
 
-// FIXME: add a guard either to the central struct or to the entries
-
+// FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
 struct Entry<T, M: Metadata = ()> {
-    tid: AtomicUsize, // FIXME: do we even need this with `thread` and `guard`?
     guard: AtomicUsize,
     alternative_entry: AtomicPtr<Entry<T, M>>,
     free_list: AtomicPtr<FreeList>,
@@ -138,21 +137,30 @@ impl<T, M: Metadata> Entry<T, M> {
 
     /// This should only be called when the central `ThreadLocal`
     /// struct gets dropped.
-    pub(crate) unsafe fn try_detach_thread(&self) {
+    pub(crate) unsafe fn try_detach_thread<const N: usize>(&self, cleanup: &mut SmallVec<[*const Entry<T, M>; N]>) {
         let alt = self.alternative_entry.load(Ordering::Acquire);
 
         if let Some(alt) = alt.as_ref() {
-            alt.try_detach_thread_locally();
+            if !alt.try_detach_thread_locally() {
+                cleanup.push(alt as *const _);
+            }
         }
 
-        self.try_detach_thread_locally();
+        if !self.try_detach_thread_locally() {
+            cleanup.push(self as *const _);
+        }
     }
 
-    pub(crate) unsafe fn try_detach_thread_locally(&self) {
+    /// Returns whether the entry has been cleaned up or not
+    pub(crate) unsafe fn try_detach_thread_locally(&self) -> bool {
+        let guard = self.guard.load(Ordering::Acquire);
         // the entry is either empty or the guard is currently active
-        if self.guard.load(Ordering::Acquire) != GUARD_READY ||
-            self.guard.compare_exchange(GUARD_READY, GUARD_ACTIVE, Ordering::Release, Ordering::Relaxed).is_err() {
-            return;
+        if guard != GUARD_READY {
+            return guard != GUARD_ACTIVE;
+        }
+        // the entry is either empty or the guard is currently active
+        if let Err(val) = self.guard.compare_exchange(GUARD_READY, GUARD_ACTIVE, Ordering::Release, Ordering::Relaxed) {
+            return val != GUARD_ACTIVE;
         }
 
         // FIXME: this probably isn't necessary as we already checked whether this entry is
@@ -170,14 +178,15 @@ impl<T, M: Metadata> Entry<T, M> {
         loop {
             match unsafe { &*free_list }.free_list.try_lock() {
                 Ok(mut guard) => {
+                    // we got the lock and can now remove our entry from the free list
                     guard.remove(&(self as *const Entry<T, M> as usize));
-                    return;
+                    return true;
                 }
                 Err(_) => {
                     // check if the thread declared that it was dropping, if so give up.
                     if unsafe { &*free_list }.dropping.load(Ordering::Acquire) {
                         self.guard.store(GUARD_READY, Ordering::Release);
-                        return;
+                        return false;
                     }
 
                     // FIXME: do we have a better way to wait (but be able to see a change in dropping)
@@ -196,13 +205,14 @@ impl<T, M: Metadata> Entry<T, M> {
         // clean up the value as we already know at this point that there is a value present
         unsafe { ptr::drop_in_place(slf.value.get()); }
         // signal that there is no thread associated with the entry anymore.
-        slf.tid.store(INVALID_THREAD_ID, Ordering::Release);
+        slf.free_list.store(null_mut(), Ordering::Release);
+        slf.guard.store(GUARD_EMPTY, Ordering::Release); // FIXME: is it okay to store GUARD_EMPTY even if there is still an alternative_entry present?
     }
 }
 
 impl<T, M: Metadata> Drop for Entry<T, M> {
     fn drop(&mut self) {
-        if *self.tid.get_mut() != INVALID_THREAD_ID {
+        if *self.guard.get_mut() != GUARD_EMPTY {
             unsafe { ptr::drop_in_place((*self.value.get()).as_mut_ptr()); }
         }
         // FIXME: clean up all alternative entries at the central struct, so we don't have to
@@ -243,18 +253,58 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
             }
 
             if bucket_ptr.is_null() {
-                continue;
+                // we went up high enough to find an empty bucket, we now know that
+                // there are no more non-empty buckets.
+                break;
             }
 
-            // FIXME: use a stacklocal vec to capture all unfinished entries and iterate over them after trying to
-            // FIXME: detach all threads once in order to ensure dropping is valid!
+            // capture all unfinished entries and iterate over them after trying to
+            // detach all threads once in order to ensure dropping is valid
+            let mut unfinished = smallvec![];
             for offset in 0..this_bucket_size {
                 let entry = unsafe { bucket_ptr.add(offset).as_ref().unwrap_unchecked() };
-                unsafe { entry.try_detach_thread(); }
+                unsafe { entry.try_detach_thread::<8>(&mut unfinished); }
+            }
+
+            for entry in unfinished.into_iter() {
+                let entry = unsafe { &*entry };
+                let mut backoff = Backoff::new();
+                while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE {
+                    backoff.snooze();
+                }
             }
 
             unsafe { deallocate_bucket(bucket_ptr, this_bucket_size) };
         }
+
+        // free alternative buckets
+        for (i, bucket) in self.alternative_buckets.iter_mut().enumerate() {
+            let bucket_ptr = *bucket.get_mut();
+
+            let this_bucket_size = bucket_size;
+            if i != 0 {
+                bucket_size <<= 1;
+            }
+
+            if bucket_ptr.is_null() {
+                // we went up high enough to find an empty bucket, we now know that
+                // there are no more non-empty buckets.
+                break;
+            }
+
+            // FIXME: do we even need to check these alternative buckets - as we should already have awaited
+            // FIXME: all of them while awaiting the "normal" buckets.
+            for offset in 0..this_bucket_size {
+                let entry = unsafe { bucket_ptr.add(offset).as_ref().unwrap_unchecked() };
+                let mut backoff = Backoff::new();
+                while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE {
+                    backoff.snooze();
+                }
+            }
+
+            unsafe { deallocate_bucket(bucket_ptr, this_bucket_size) };
+        }
+
     }
 }
 
@@ -633,14 +683,16 @@ impl<T: Send + fmt::Debug, M: Metadata> fmt::Debug for ThreadLocal<T, M> {
 
 impl<T: Send + UnwindSafe, M: Metadata> UnwindSafe for ThreadLocal<T, M> {}
 
+// FIXME: support alternative_entry
 #[derive(Debug)]
-struct RawIter {
+struct RawIter<const NEW_GUARD: usize> {
     yielded: usize,
     bucket: usize,
     bucket_size: usize,
     index: usize,
 }
-impl RawIter {
+
+impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
     #[inline]
     fn new() -> Self {
         Self {
@@ -660,7 +712,7 @@ impl RawIter {
                 while self.index < self.bucket_size {
                     let entry = unsafe { &*bucket.add(self.index) };
                     self.index += 1;
-                    if entry.tid.load(Ordering::Acquire) != INVALID_THREAD_ID {
+                    if entry.guard.compare_exchange(GUARD_READY, NEW_GUARD, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                         self.yielded += 1;
                         return Some(entry);
                     }
@@ -687,7 +739,7 @@ impl RawIter {
                 while self.index < self.bucket_size {
                     let entry = unsafe { &*bucket.add(self.index) };
                     self.index += 1;
-                    if entry.tid.load(Ordering::Acquire) != INVALID_THREAD_ID {
+                    if entry.guard.compare_exchange(GUARD_READY, NEW_GUARD, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                         self.yielded += 1;
                         return Some((entry as *const Entry<T, M>).cast_mut());
                     }
@@ -722,7 +774,7 @@ impl RawIter {
 #[derive(Debug)]
 pub struct Iter<'a, T: Send + Sync, M: Metadata = ()> {
     thread_local: &'a ThreadLocal<T, M>,
-    raw: RawIter,
+    raw: RawIter<GUARD_ACTIVE>,
 }
 
 impl<'a, T: Send + Sync, M: Metadata> Iterator for Iter<'a, T, M> {
@@ -734,12 +786,13 @@ impl<'a, T: Send + Sync, M: Metadata> Iterator for Iter<'a, T, M> {
         self.raw.size_hint(self.thread_local)
     }
 }
+
 impl<T: Send + Sync, M: Metadata> FusedIterator for Iter<'_, T, M> {}
 
 /// Mutable iterator over the contents of a `ThreadLocal`.
 pub struct IterMut<'a, T: Send, M: Metadata = ()> {
     thread_local: &'a mut ThreadLocal<T, M>,
-    raw: RawIter,
+    raw: RawIter<GUARD_ACTIVE>,
 }
 
 impl<'a, T: Send, M: Metadata> Iterator for IterMut<'a, T, M> {
@@ -769,14 +822,13 @@ impl<'a, T: Send + fmt::Debug, M: Metadata> fmt::Debug for IterMut<'a, T, M> {
 #[derive(Debug)]
 pub struct IntoIter<T: Send, M: Metadata = ()> {
     thread_local: ThreadLocal<T, M>,
-    raw: RawIter,
+    raw: RawIter<GUARD_EMPTY>,
 }
 
 impl<T: Send, M: Metadata> Iterator for IntoIter<T, M> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
         self.raw.next_mut(&mut self.thread_local).map(|entry| {
-            unsafe { *(&mut *entry).tid.get_mut() = INVALID_THREAD_ID; }
             unsafe {
                 mem::replace(&mut *(&mut *entry).value.get(), MaybeUninit::uninit()).assume_init()
             }
@@ -794,7 +846,7 @@ impl<T: Send, M: Metadata> FusedIterator for IntoIter<T, M> {}
 #[derive(Debug)]
 pub struct IterMeta<'a, T: Send + Sync, M: Metadata = ()> {
     thread_local: &'a ThreadLocal<T, M>,
-    raw: RawIter,
+    raw: RawIter<GUARD_ACTIVE>,
 }
 
 impl<'a, T: Send + Sync, M: Metadata> Iterator for IterMeta<'a, T, M> {
@@ -811,7 +863,7 @@ impl<T: Send + Sync, M: Metadata> FusedIterator for IterMeta<'_, T, M> {}
 /// Mutable iterator over the contents of a `ThreadLocal`.
 pub struct IterMutMeta<'a, T: Send, M: Metadata = ()> {
     thread_local: &'a mut ThreadLocal<T, M>,
-    raw: RawIter,
+    raw: RawIter<GUARD_ACTIVE>,
 }
 
 impl<'a, T: Send, M: Metadata> Iterator for IterMutMeta<'a, T, M> {
@@ -841,7 +893,6 @@ fn allocate_bucket<T, M: Metadata>(size: usize) -> *mut Entry<T, M> {
     Box::into_raw(
         (0..size)
             .map(|_| Entry::<T, M> {
-                tid: AtomicUsize::new(INVALID_THREAD_ID),
                 guard: Default::default(),
                 alternative_entry: AtomicPtr::new(null_mut()),
                 free_list: Default::default(),

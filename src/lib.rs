@@ -112,7 +112,7 @@ pub struct ThreadLocal<T: Send, M: Metadata = ()> {
 
     /// The number of values in the thread local. This can be less than the real number of values,
     /// but is never more.
-    values: AtomicUsize,
+    values: AtomicUsize, // FIXME: try getting rid of this by adding a new variant to GUARD and checking entries individually!
 }
 
 const INVALID_THREAD_ID: usize = usize::MAX;
@@ -126,6 +126,7 @@ const GUARD_ACTIVE: usize = 2;
 
 // FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
 struct Entry<T, M: Metadata = ()> {
+    init: AtomicBool, // FIXME: try getting rid of this by adding a new variant to GUARD.
     guard: AtomicUsize,
     alternative_entry: AtomicPtr<Entry<T, M>>,
     free_list: AtomicPtr<FreeList>,
@@ -500,8 +501,12 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             entry.meta.set_default();
         }
         entry.free_list.store(thread.free_list.cast_mut(), Ordering::Release);
+        entry.guard.store(GUARD_READY, Ordering::Release);
 
-        self.values.fetch_add(1, Ordering::Release);
+        if !entry.init.load(Ordering::Acquire) {
+            entry.init.store(true, Ordering::Release);
+            self.values.fetch_add(1, Ordering::Release);
+        }
 
         unsafe { &*(&*value_ptr).as_ptr() }
     }
@@ -543,8 +548,12 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             fm(&entry.meta);
         }
         entry.free_list.store(thread.free_list.cast_mut(), Ordering::Release);
+        entry.guard.store(GUARD_READY, Ordering::Release);
 
-        self.values.fetch_add(1, Ordering::Release);
+        if !entry.init.load(Ordering::Acquire) {
+            entry.init.store(true, Ordering::Release);
+            self.values.fetch_add(1, Ordering::Release);
+        }
 
         (unsafe { &*(&*value_ptr).as_ptr() }, &entry.meta)
     }
@@ -893,6 +902,7 @@ fn allocate_bucket<T, M: Metadata>(size: usize) -> *mut Entry<T, M> {
     Box::into_raw(
         (0..size)
             .map(|_| Entry::<T, M> {
+                init: Default::default(),
                 guard: Default::default(),
                 alternative_entry: AtomicPtr::new(null_mut()),
                 free_list: Default::default(),

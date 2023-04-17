@@ -117,16 +117,16 @@ pub struct ThreadLocal<T: Send, M: Metadata = ()> {
 
 const INVALID_THREAD_ID: usize = usize::MAX;
 
+const GUARD_UNINIT: usize = 0;
 // there is nothing to guard, so the guard can't be used
-const GUARD_EMPTY: usize = 0;
+const GUARD_EMPTY: usize = 1;
 // the guard is ready to be used (changed to active/empty)
-const GUARD_READY: usize = 1;
+const GUARD_READY: usize = 2;
 // the guard is currently active and anybody wanting to use it has to wait
-const GUARD_ACTIVE: usize = 2;
+const GUARD_ACTIVE: usize = 3;
 
 // FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
 struct Entry<T, M: Metadata = ()> {
-    init: AtomicBool, // FIXME: try getting rid of this by adding a new variant to GUARD.
     guard: AtomicUsize,
     alternative_entry: AtomicPtr<Entry<T, M>>,
     free_list: AtomicPtr<FreeList>,
@@ -159,19 +159,10 @@ impl<T, M: Metadata> Entry<T, M> {
         if guard != GUARD_READY {
             return guard != GUARD_ACTIVE;
         }
-        // the entry is either empty or the guard is currently active
+        // the entry is `Ready`, so we know that we can get exclusive access to it
         if let Err(val) = self.guard.compare_exchange(GUARD_READY, GUARD_ACTIVE, Ordering::Release, Ordering::Relaxed) {
             return val != GUARD_ACTIVE;
         }
-
-        // FIXME: this probably isn't necessary as we already checked whether this entry is
-        // FIXME: active by checking `guard`
-        /*
-        let tid = self.tid.load(Ordering::Acquire);
-        if tid == INVALID_THREAD_ID {
-            self.guard.store(GUARD_EMPTY, Ordering::Release);
-            return;
-        }*/
 
         let free_list = self.free_list.load(Ordering::Acquire);
 
@@ -213,7 +204,8 @@ impl<T, M: Metadata> Entry<T, M> {
 
 impl<T, M: Metadata> Drop for Entry<T, M> {
     fn drop(&mut self) {
-        if *self.guard.get_mut() != GUARD_EMPTY {
+        let guard = *self.guard.get_mut();
+        if guard == GUARD_READY || guard == GUARD_ACTIVE {
             unsafe { ptr::drop_in_place((*self.value.get()).as_mut_ptr()); }
         }
         // FIXME: clean up all alternative entries at the central struct, so we don't have to
@@ -298,7 +290,7 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
             for offset in 0..this_bucket_size {
                 let entry = unsafe { bucket_ptr.add(offset).as_ref().unwrap_unchecked() };
                 let mut backoff = Backoff::new();
-                while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE {
+                while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE { // FIXME: allow active guard as long as this thread activated the guard (split up GUARD_ACTIVE in 2 different guard values)
                     backoff.snooze();
                 }
             }
@@ -501,10 +493,10 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             entry.meta.set_default();
         }
         entry.free_list.store(thread.free_list.cast_mut(), Ordering::Release);
+        let guard = entry.guard.load(Ordering::Acquire);
         entry.guard.store(GUARD_READY, Ordering::Release);
 
-        if !entry.init.load(Ordering::Acquire) {
-            entry.init.store(true, Ordering::Release);
+        if guard == GUARD_UNINIT {
             self.values.fetch_add(1, Ordering::Release);
         }
 
@@ -548,10 +540,10 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             fm(&entry.meta);
         }
         entry.free_list.store(thread.free_list.cast_mut(), Ordering::Release);
+        let guard = entry.guard.load(Ordering::Acquire);
         entry.guard.store(GUARD_READY, Ordering::Release);
 
-        if !entry.init.load(Ordering::Acquire) {
-            entry.init.store(true, Ordering::Release);
+        if guard == GUARD_UNINIT {
             self.values.fetch_add(1, Ordering::Release);
         }
 
@@ -613,7 +605,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
     }
 
     /// Removes all thread-specific values from the `ThreadLocal`, effectively
-    /// reseting it to its original state.
+    /// resetting it to its original state.
     ///
     /// Since this call borrows the `ThreadLocal` mutably, this operation can
     /// be done safely---the mutable borrow statically guarantees no other
@@ -717,14 +709,16 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
             let bucket = unsafe { thread_local.buckets.get_unchecked(self.bucket) };
             let bucket = bucket.load(Ordering::Acquire);
 
-            if !bucket.is_null() {
-                while self.index < self.bucket_size {
-                    let entry = unsafe { &*bucket.add(self.index) };
-                    self.index += 1;
-                    if entry.guard.compare_exchange(GUARD_READY, NEW_GUARD, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                        self.yielded += 1;
-                        return Some(entry);
-                    }
+            if bucket.is_null() {
+                return None;
+            }
+
+            while self.index < self.bucket_size {
+                let entry = unsafe { &*bucket.add(self.index) };
+                self.index += 1;
+                if entry.guard.compare_exchange(GUARD_READY, NEW_GUARD, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    self.yielded += 1;
+                    return Some(entry);
                 }
             }
 
@@ -732,11 +726,12 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
         }
         None
     }
+
     fn next_mut<T: Send, M: Metadata>(
         &mut self,
         thread_local: &mut ThreadLocal<T, M>,
     ) -> Option<*mut Entry<T, M>> {
-        if *thread_local.values.get_mut() == self.yielded {
+        if *thread_local.values.get_mut() == self.yielded { // FIXME: check the guard's value instead of the values.
             return None;
         }
 
@@ -744,13 +739,22 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
             let bucket = unsafe { thread_local.buckets.get_unchecked_mut(self.bucket) };
             let bucket = *bucket.get_mut();
 
-            if !bucket.is_null() {
-                while self.index < self.bucket_size {
-                    let entry = unsafe { &*bucket.add(self.index) };
-                    self.index += 1;
-                    if entry.guard.compare_exchange(GUARD_READY, NEW_GUARD, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            if bucket.is_null() {
+                return None;
+            }
+
+            while self.index < self.bucket_size {
+                let entry = unsafe { &*bucket.add(self.index) };
+                self.index += 1;
+                match entry.guard.compare_exchange(GUARD_READY, NEW_GUARD, Ordering::AcqRel, Ordering::Relaxed) {
+                    Ok(_) => {
                         self.yielded += 1;
                         return Some((entry as *const Entry<T, M>).cast_mut());
+                    }
+                    Err(err) => {
+                        if err == GUARD_UNINIT {
+                            return None;
+                        }
                     }
                 }
             }
@@ -772,6 +776,7 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
         let total = thread_local.values.load(Ordering::Acquire);
         (total - self.yielded, None)
     }
+
     fn size_hint_frozen<T: Send, M: Metadata>(&self, thread_local: &ThreadLocal<T, M>) -> (usize, Option<usize>) {
         let total = unsafe { *(&thread_local.values as *const AtomicUsize as *const usize) };
         let remaining = total - self.yielded;
@@ -788,9 +793,11 @@ pub struct Iter<'a, T: Send + Sync, M: Metadata = ()> {
 
 impl<'a, T: Send + Sync, M: Metadata> Iterator for Iter<'a, T, M> {
     type Item = &'a T;
+
     fn next(&mut self) -> Option<Self::Item> {
         self.raw.next(self.thread_local).map(|entry| unsafe { &*(&*entry.value.get()).as_ptr() })
     }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.raw.size_hint(self.thread_local)
     }
@@ -806,11 +813,13 @@ pub struct IterMut<'a, T: Send, M: Metadata = ()> {
 
 impl<'a, T: Send, M: Metadata> Iterator for IterMut<'a, T, M> {
     type Item = &'a mut T;
+
     fn next(&mut self) -> Option<&'a mut T> {
         self.raw
             .next_mut(self.thread_local)
             .map(|entry| unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() })
     }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.raw.size_hint_frozen(self.thread_local)
     }
@@ -836,6 +845,7 @@ pub struct IntoIter<T: Send, M: Metadata = ()> {
 
 impl<T: Send, M: Metadata> Iterator for IntoIter<T, M> {
     type Item = T;
+
     fn next(&mut self) -> Option<T> {
         self.raw.next_mut(&mut self.thread_local).map(|entry| {
             unsafe {
@@ -843,6 +853,7 @@ impl<T: Send, M: Metadata> Iterator for IntoIter<T, M> {
             }
         })
     }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.raw.size_hint_frozen(&self.thread_local)
     }
@@ -860,9 +871,11 @@ pub struct IterMeta<'a, T: Send + Sync, M: Metadata = ()> {
 
 impl<'a, T: Send + Sync, M: Metadata> Iterator for IterMeta<'a, T, M> {
     type Item = (&'a T, &'a M);
+
     fn next(&mut self) -> Option<Self::Item> {
         self.raw.next(self.thread_local).map(|entry| (unsafe { &*(&*entry.value.get()).as_ptr() }, &entry.meta))
     }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.raw.size_hint(self.thread_local)
     }
@@ -877,11 +890,13 @@ pub struct IterMutMeta<'a, T: Send, M: Metadata = ()> {
 
 impl<'a, T: Send, M: Metadata> Iterator for IterMutMeta<'a, T, M> {
     type Item = (&'a mut T, &'a M);
+
     fn next(&mut self) -> Option<(&'a mut T, &'a M)> {
         self.raw
             .next_mut(self.thread_local)
             .map(move |entry| (unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() }, unsafe { &(&*entry).meta }))
     }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.raw.size_hint_frozen(self.thread_local)
     }
@@ -902,7 +917,6 @@ fn allocate_bucket<T, M: Metadata>(size: usize) -> *mut Entry<T, M> {
     Box::into_raw(
         (0..size)
             .map(|_| Entry::<T, M> {
-                init: Default::default(),
                 guard: Default::default(),
                 alternative_entry: AtomicPtr::new(null_mut()),
                 free_list: Default::default(),

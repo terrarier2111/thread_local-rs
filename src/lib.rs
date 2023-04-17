@@ -731,11 +731,7 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
         &mut self,
         thread_local: &mut ThreadLocal<T, M>,
     ) -> Option<*mut Entry<T, M>> {
-        if *thread_local.values.get_mut() == self.yielded { // FIXME: check the guard's value instead of the values.
-            return None;
-        }
-
-        loop {
+        while self.bucket < BUCKETS {
             let bucket = unsafe { thread_local.buckets.get_unchecked_mut(self.bucket) };
             let bucket = *bucket.get_mut();
 
@@ -761,6 +757,7 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
 
             self.next_bucket();
         }
+        None
     }
 
     #[inline]

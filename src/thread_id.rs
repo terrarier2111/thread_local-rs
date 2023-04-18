@@ -71,7 +71,6 @@ pub(crate) struct Thread {
     pub(crate) free_list: *const FreeList,
 }
 
-
 impl Thread {
     fn new(id: usize, free_list: *const FreeList) -> Thread {
         let bucket = usize::from(POINTER_WIDTH) - id.leading_zeros() as usize;
@@ -91,7 +90,6 @@ impl Thread {
     pub(crate) fn bucket_size(&self) -> usize {
         1 << self.bucket.saturating_sub(1)
     }
-
 }
 
 pub(crate) struct FreeList {
@@ -100,7 +98,6 @@ pub(crate) struct FreeList {
 }
 
 impl FreeList {
-    
     fn new() -> Self {
         Self {
             dropping: Default::default(),
@@ -112,10 +109,11 @@ impl FreeList {
         self.dropping.store(true, Ordering::Release);
         let mut free_list = self.free_list.lock();
         for entry in free_list.unwrap().iter() {
-            unsafe { entry.1.cleanup(*entry.0 as *const ()); }
+            unsafe {
+                entry.1.cleanup(*entry.0 as *const ());
+            }
         }
     }
-
 }
 
 pub(crate) struct EntryData {
@@ -123,13 +121,11 @@ pub(crate) struct EntryData {
 }
 
 impl EntryData {
-
     #[inline]
     unsafe fn cleanup(&self, data: *const ()) {
         let dfn = self.drop_fn;
         unsafe { dfn(data) };
     }
-
 }
 
 // This is split into 2 thread-local variables so that we can check whether the
@@ -153,7 +149,10 @@ impl Drop for ThreadGuard {
         unsafe {
             FREE_LIST.take().unwrap_unchecked().cleanup();
         }
-        THREAD_ID_MANAGER.lock().unwrap().free(unsafe { THREAD.as_ref().unwrap_unchecked().id });
+        THREAD_ID_MANAGER
+            .lock()
+            .unwrap()
+            .free(unsafe { THREAD.as_ref().unwrap_unchecked().id });
     }
 }
 
@@ -170,8 +169,12 @@ pub(crate) fn get() -> Thread {
 /// Out-of-line slow path for allocating a thread ID.
 #[cold]
 fn get_slow() -> Thread {
-    unsafe { FREE_LIST = Some(FreeList::new()); }
-    let new = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc(), unsafe { FREE_LIST.as_ref().unwrap_unchecked() as *const FreeList });
+    unsafe {
+        FREE_LIST = Some(FreeList::new());
+    }
+    let new = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc(), unsafe {
+        FREE_LIST.as_ref().unwrap_unchecked() as *const FreeList
+    });
     unsafe {
         THREAD = Some(new);
     }

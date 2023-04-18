@@ -74,19 +74,19 @@ mod unreachable;
 #[allow(deprecated)]
 pub use cached::{CachedIntoIter, CachedIterMut, CachedThreadLocal};
 
+use crate::thread_id::{FreeList, Thread};
+use crossbeam_utils::Backoff;
+use smallvec::{smallvec, SmallVec};
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::iter::FusedIterator;
 use std::mem;
-use std::mem::{MaybeUninit, size_of, transmute};
+use std::mem::{size_of, transmute, MaybeUninit};
 use std::panic::UnwindSafe;
 use std::ptr;
-use std::ptr::{NonNull, null_mut};
+use std::ptr::{null_mut, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::TryLockResult;
-use crossbeam_utils::Backoff;
-use smallvec::{smallvec, SmallVec};
-use crate::thread_id::{FreeList, Thread};
 use unreachable::UncheckedResultExt;
 
 // Use usize::BITS once it has stabilized and the MSRV has been bumped.
@@ -109,10 +109,6 @@ pub struct ThreadLocal<T: Send, M: Metadata = ()> {
     buckets: [AtomicPtr<Entry<T, M>>; BUCKETS],
 
     alternative_buckets: [AtomicPtr<Entry<T, M>>; BUCKETS],
-
-    /// The number of values in the thread local. This can be less than the real number of values,
-    /// but is never more.
-    values: AtomicUsize, // FIXME: try getting rid of this by adding a new variant to GUARD and checking entries individually!
 }
 
 const INVALID_THREAD_ID: usize = usize::MAX;
@@ -135,10 +131,12 @@ struct Entry<T, M: Metadata = ()> {
 }
 
 impl<T, M: Metadata> Entry<T, M> {
-
     /// This should only be called when the central `ThreadLocal`
     /// struct gets dropped.
-    pub(crate) unsafe fn try_detach_thread<const N: usize>(&self, cleanup: &mut SmallVec<[*const Entry<T, M>; N]>) {
+    pub(crate) unsafe fn try_detach_thread<const N: usize>(
+        &self,
+        cleanup: &mut SmallVec<[*const Entry<T, M>; N]>,
+    ) {
         let alt = self.alternative_entry.load(Ordering::Acquire);
 
         if let Some(alt) = alt.as_ref() {
@@ -160,7 +158,12 @@ impl<T, M: Metadata> Entry<T, M> {
             return guard != GUARD_ACTIVE;
         }
         // the entry is `Ready`, so we know that we can get exclusive access to it
-        if let Err(val) = self.guard.compare_exchange(GUARD_READY, GUARD_ACTIVE, Ordering::Release, Ordering::Relaxed) {
+        if let Err(val) = self.guard.compare_exchange(
+            GUARD_READY,
+            GUARD_ACTIVE,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
             return val != GUARD_ACTIVE;
         }
 
@@ -191,11 +194,22 @@ impl<T, M: Metadata> Entry<T, M> {
     pub(crate) unsafe fn cleanup(slf: *const Self) {
         let slf = unsafe { &*slf };
         let mut backoff = Backoff::new();
-        while slf.guard.compare_exchange_weak(GUARD_READY, GUARD_ACTIVE, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        while slf
+            .guard
+            .compare_exchange_weak(
+                GUARD_READY,
+                GUARD_ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
             backoff.snooze();
         }
         // clean up the value as we already know at this point that there is a value present
-        unsafe { ptr::drop_in_place(slf.value.get()); }
+        unsafe {
+            ptr::drop_in_place(slf.value.get());
+        }
         // signal that there is no thread associated with the entry anymore.
         slf.free_list.store(null_mut(), Ordering::Release);
         slf.guard.store(GUARD_EMPTY, Ordering::Release); // FIXME: is it okay to store GUARD_EMPTY even if there is still an alternative_entry present?
@@ -206,7 +220,9 @@ impl<T, M: Metadata> Drop for Entry<T, M> {
     fn drop(&mut self) {
         let guard = *self.guard.get_mut();
         if guard == GUARD_READY || guard == GUARD_ACTIVE {
-            unsafe { ptr::drop_in_place((*self.value.get()).as_mut_ptr()); }
+            unsafe {
+                ptr::drop_in_place((*self.value.get()).as_mut_ptr());
+            }
         }
         // FIXME: clean up all alternative entries at the central struct, so we don't have to
         // FIXME: do it here, locally.
@@ -256,7 +272,9 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
             let mut unfinished = smallvec![];
             for offset in 0..this_bucket_size {
                 let entry = unsafe { bucket_ptr.add(offset).as_ref().unwrap_unchecked() };
-                unsafe { entry.try_detach_thread::<8>(&mut unfinished); }
+                unsafe {
+                    entry.try_detach_thread::<8>(&mut unfinished);
+                }
             }
 
             for entry in unfinished.into_iter() {
@@ -290,14 +308,14 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
             for offset in 0..this_bucket_size {
                 let entry = unsafe { bucket_ptr.add(offset).as_ref().unwrap_unchecked() };
                 let mut backoff = Backoff::new();
-                while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE { // FIXME: allow active guard as long as this thread activated the guard (split up GUARD_ACTIVE in 2 different guard values)
+                while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE {
+                    // FIXME: allow active guard as long as this thread activated the guard (split up GUARD_ACTIVE in 2 different guard values)
                     backoff.snooze();
                 }
             }
 
             unsafe { deallocate_bucket(bucket_ptr, this_bucket_size) };
         }
-
     }
 }
 
@@ -328,7 +346,10 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
 
         let mut alternative_buckets = [null_mut(); BUCKETS];
         let mut bucket_size = 1;
-        for (i, bucket) in alternative_buckets[..allocated_buckets].iter_mut().enumerate() {
+        for (i, bucket) in alternative_buckets[..allocated_buckets]
+            .iter_mut()
+            .enumerate()
+        {
             *bucket = allocate_bucket::<T, M>(bucket_size);
 
             if i != 0 {
@@ -341,7 +362,6 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             // representation as a sequence of their inner type.
             buckets: unsafe { transmute(buckets) },
             alternative_buckets: unsafe { transmute(alternative_buckets) },
-            values: AtomicUsize::new(0),
         }
     }
 
@@ -375,9 +395,9 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
     /// Returns the meta and value of the element for the current thread, or creates it if it doesn't
     /// exist.
     pub fn get_val_and_meta_or<F, MF>(&self, create: F, meta: MF) -> (&T, &M)
-        where
-            F: FnOnce(*const M) -> T,
-            MF: FnOnce(&M),
+    where
+        F: FnOnce(*const M) -> T,
+        MF: FnOnce(&M),
     {
         let thread = thread_id::get();
         if let Some(val) = self.get_inner_val_and_meta(thread) {
@@ -492,13 +512,10 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         if size_of::<M>() > 0 {
             entry.meta.set_default();
         }
-        entry.free_list.store(thread.free_list.cast_mut(), Ordering::Release);
-        let guard = entry.guard.load(Ordering::Acquire);
+        entry
+            .free_list
+            .store(thread.free_list.cast_mut(), Ordering::Release);
         entry.guard.store(GUARD_READY, Ordering::Release);
-
-        if guard == GUARD_UNINIT {
-            self.values.fetch_add(1, Ordering::Release);
-        }
 
         unsafe { &*(&*value_ptr).as_ptr() }
     }
@@ -539,13 +556,10 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         if size_of::<M>() > 0 {
             fm(&entry.meta);
         }
-        entry.free_list.store(thread.free_list.cast_mut(), Ordering::Release);
-        let guard = entry.guard.load(Ordering::Acquire);
+        entry
+            .free_list
+            .store(thread.free_list.cast_mut(), Ordering::Release);
         entry.guard.store(GUARD_READY, Ordering::Release);
-
-        if guard == GUARD_UNINIT {
-            self.values.fetch_add(1, Ordering::Release);
-        }
 
         (unsafe { &*(&*value_ptr).as_ptr() }, &entry.meta)
     }
@@ -582,8 +596,8 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
     ///
     /// This call can be done safely, as `T` is required to implement [`Sync`].
     pub fn iter_meta(&self) -> IterMeta<'_, T, M>
-        where
-            T: Sync,
+    where
+        T: Sync,
     {
         IterMeta {
             thread_local: self,
@@ -618,24 +632,43 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
     /// `T` that was returned by some call to this `ThreadLocal`.
     #[inline]
     pub unsafe fn val_meta_ptr_from_val(val: NonNull<T>) -> ValMetaPtr<T, M> {
-        ValMetaPtr(NonNull::new_unchecked(val.as_ptr().cast::<u8>().offset(memoffset::offset_of!(Entry::<T, M>, value) as isize * -1).cast::<Entry<T, M>>()))
+        ValMetaPtr(NonNull::new_unchecked(
+            val.as_ptr()
+                .cast::<u8>()
+                .offset(memoffset::offset_of!(Entry::<T, M>, value) as isize * -1)
+                .cast::<Entry<T, M>>(),
+        ))
     }
 }
 
 pub struct ValMetaPtr<T, M: Metadata>(NonNull<Entry<T, M>>);
 
 impl<T, M: Metadata> ValMetaPtr<T, M> {
-
     #[inline]
     pub fn val_ptr(self) -> NonNull<T> {
-        unsafe { NonNull::new_unchecked(self.0.as_ptr().cast::<u8>().add(memoffset::offset_of!(Entry::<T, M>, value)).cast::<T>()) }
+        unsafe {
+            NonNull::new_unchecked(
+                self.0
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(memoffset::offset_of!(Entry::<T, M>, value))
+                    .cast::<T>(),
+            )
+        }
     }
 
     #[inline]
     pub fn meta_ptr(self) -> NonNull<M> {
-        unsafe { NonNull::new_unchecked(self.0.as_ptr().cast::<u8>().add(memoffset::offset_of!(Entry::<T, M>, meta)).cast::<M>()) }
+        unsafe {
+            NonNull::new_unchecked(
+                self.0
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(memoffset::offset_of!(Entry::<T, M>, meta))
+                    .cast::<M>(),
+            )
+        }
     }
-
 }
 
 impl<T: Send, M: Metadata> IntoIterator for ThreadLocal<T, M> {
@@ -704,7 +737,10 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
         }
     }
 
-    fn next<'a, T: Send + Sync, M: Metadata>(&mut self, thread_local: &'a ThreadLocal<T, M>) -> Option<&'a Entry<T, M>> {
+    fn next<'a, T: Send + Sync, M: Metadata>(
+        &mut self,
+        thread_local: &'a ThreadLocal<T, M>,
+    ) -> Option<&'a Entry<T, M>> {
         while self.bucket < BUCKETS {
             let bucket = unsafe { thread_local.buckets.get_unchecked(self.bucket) };
             let bucket = bucket.load(Ordering::Acquire);
@@ -716,7 +752,11 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
             while self.index < self.bucket_size {
                 let entry = unsafe { &*bucket.add(self.index) };
                 self.index += 1;
-                if entry.guard.compare_exchange(GUARD_READY, NEW_GUARD, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                if entry
+                    .guard
+                    .compare_exchange(GUARD_READY, NEW_GUARD, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
                     self.yielded += 1;
                     return Some(entry);
                 }
@@ -742,7 +782,12 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
             while self.index < self.bucket_size {
                 let entry = unsafe { &*bucket.add(self.index) };
                 self.index += 1;
-                match entry.guard.compare_exchange(GUARD_READY, NEW_GUARD, Ordering::AcqRel, Ordering::Relaxed) {
+                match entry.guard.compare_exchange(
+                    GUARD_READY,
+                    NEW_GUARD,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => {
                         self.yielded += 1;
                         return Some((entry as *const Entry<T, M>).cast_mut());
@@ -768,17 +813,6 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
         self.bucket += 1;
         self.index = 0;
     }
-
-    fn size_hint<T: Send, M: Metadata>(&self, thread_local: &ThreadLocal<T, M>) -> (usize, Option<usize>) {
-        let total = thread_local.values.load(Ordering::Acquire);
-        (total - self.yielded, None)
-    }
-
-    fn size_hint_frozen<T: Send, M: Metadata>(&self, thread_local: &ThreadLocal<T, M>) -> (usize, Option<usize>) {
-        let total = unsafe { *(&thread_local.values as *const AtomicUsize as *const usize) };
-        let remaining = total - self.yielded;
-        (remaining, Some(remaining))
-    }
 }
 
 /// Iterator over the contents of a `ThreadLocal`.
@@ -792,11 +826,9 @@ impl<'a, T: Send + Sync, M: Metadata> Iterator for Iter<'a, T, M> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.raw.next(self.thread_local).map(|entry| unsafe { &*(&*entry.value.get()).as_ptr() })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.raw.size_hint(self.thread_local)
+        self.raw
+            .next(self.thread_local)
+            .map(|entry| unsafe { &*(&*entry.value.get()).as_ptr() })
     }
 }
 
@@ -815,10 +847,6 @@ impl<'a, T: Send, M: Metadata> Iterator for IterMut<'a, T, M> {
         self.raw
             .next_mut(self.thread_local)
             .map(|entry| unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.raw.size_hint_frozen(self.thread_local)
     }
 }
 
@@ -844,15 +872,11 @@ impl<T: Send, M: Metadata> Iterator for IntoIter<T, M> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
-        self.raw.next_mut(&mut self.thread_local).map(|entry| {
-            unsafe {
+        self.raw
+            .next_mut(&mut self.thread_local)
+            .map(|entry| unsafe {
                 mem::replace(&mut *(&mut *entry).value.get(), MaybeUninit::uninit()).assume_init()
-            }
-        })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.raw.size_hint_frozen(&self.thread_local)
+            })
     }
 }
 
@@ -870,11 +894,9 @@ impl<'a, T: Send + Sync, M: Metadata> Iterator for IterMeta<'a, T, M> {
     type Item = (&'a T, &'a M);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.raw.next(self.thread_local).map(|entry| (unsafe { &*(&*entry.value.get()).as_ptr() }, &entry.meta))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.raw.size_hint(self.thread_local)
+        self.raw
+            .next(self.thread_local)
+            .map(|entry| (unsafe { &*(&*entry.value.get()).as_ptr() }, &entry.meta))
     }
 }
 impl<T: Send + Sync, M: Metadata> FusedIterator for IterMeta<'_, T, M> {}
@@ -889,13 +911,12 @@ impl<'a, T: Send, M: Metadata> Iterator for IterMutMeta<'a, T, M> {
     type Item = (&'a mut T, &'a M);
 
     fn next(&mut self) -> Option<(&'a mut T, &'a M)> {
-        self.raw
-            .next_mut(self.thread_local)
-            .map(move |entry| (unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() }, unsafe { &(&*entry).meta }))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.raw.size_hint_frozen(self.thread_local)
+        self.raw.next_mut(self.thread_local).map(move |entry| {
+            (
+                unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() },
+                unsafe { &(&*entry).meta },
+            )
+        })
     }
 }
 
@@ -906,7 +927,9 @@ impl<T: Send, M: Metadata> FusedIterator for IterMutMeta<'_, T, M> {}
 // this thread's value that potentially aliases with a mutable reference we have given out.
 impl<'a, T: Send + fmt::Debug, M: Metadata> fmt::Debug for IterMutMeta<'a, T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IterMutMeta").field("raw", &self.raw).finish()
+        f.debug_struct("IterMutMeta")
+            .field("raw", &self.raw)
+            .finish()
     }
 }
 
@@ -929,9 +952,7 @@ unsafe fn deallocate_bucket<T, M: Metadata>(bucket: *mut Entry<T, M>, size: usiz
 }
 
 pub trait Metadata: Send + Sync + Default {
-
     fn set_default(&self);
-
 }
 
 impl Metadata for () {

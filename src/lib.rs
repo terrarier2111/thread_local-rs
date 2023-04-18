@@ -119,7 +119,8 @@ const GUARD_EMPTY: usize = 1;
 // the guard is ready to be used (changed to active/empty)
 const GUARD_READY: usize = 2;
 // the guard is currently active and anybody wanting to use it has to wait
-const GUARD_ACTIVE: usize = 3;
+const GUARD_ACTIVE_INTERNAL: usize = 3;
+const GUARD_ACTIVE_EXTERNAL: usize = 4;
 
 // FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
 struct Entry<T, M: Metadata = ()> {
@@ -155,23 +156,23 @@ impl<T, M: Metadata> Entry<T, M> {
         let guard = self.guard.load(Ordering::Acquire);
         // the entry is either empty or the guard is currently active
         if guard != GUARD_READY {
-            return guard != GUARD_ACTIVE;
+            return guard != GUARD_ACTIVE_EXTERNAL;
         }
         // the entry is `Ready`, so we know that we can get exclusive access to it
         if let Err(val) = self.guard.compare_exchange(
             GUARD_READY,
-            GUARD_ACTIVE,
-            Ordering::Release,
+            GUARD_ACTIVE_INTERNAL,
+            Ordering::AcqRel,
             Ordering::Relaxed,
         ) {
-            return val != GUARD_ACTIVE;
+            return val != GUARD_ACTIVE_EXTERNAL;
         }
 
         let free_list = self.free_list.load(Ordering::Acquire);
 
         let mut backoff = Backoff::new();
         loop {
-            match unsafe { &*free_list }.free_list.try_lock() {
+            match unsafe { &*free_list }.free_list.try_lock() { // FIXME: this can deref an already dealloced piece of memory.
                 Ok(mut guard) => {
                     // we got the lock and can now remove our entry from the free list
                     guard.remove(&(self as *const Entry<T, M> as usize));
@@ -198,7 +199,7 @@ impl<T, M: Metadata> Entry<T, M> {
             .guard
             .compare_exchange_weak(
                 GUARD_READY,
-                GUARD_ACTIVE,
+                GUARD_ACTIVE_EXTERNAL,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             )
@@ -219,17 +220,11 @@ impl<T, M: Metadata> Entry<T, M> {
 impl<T, M: Metadata> Drop for Entry<T, M> {
     fn drop(&mut self) {
         let guard = *self.guard.get_mut();
-        if guard == GUARD_READY || guard == GUARD_ACTIVE {
+        if guard == GUARD_READY || guard == GUARD_ACTIVE_INTERNAL {
             unsafe {
                 ptr::drop_in_place((*self.value.get()).as_mut_ptr());
             }
         }
-        // FIXME: clean up all alternative entries at the central struct, so we don't have to
-        // FIXME: do it here, locally.
-        /*let alt = self.alternative_entry.load(Ordering::Acquire);
-        if !alt.is_null() {
-            unsafe { ptr::drop_in_place(alt); }
-        }*/
     }
 }
 
@@ -280,7 +275,7 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
             for entry in unfinished.into_iter() {
                 let entry = unsafe { &*entry };
                 let mut backoff = Backoff::new();
-                while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE {
+                while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE_EXTERNAL {
                     backoff.snooze();
                 }
             }
@@ -308,8 +303,7 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
             for offset in 0..this_bucket_size {
                 let entry = unsafe { bucket_ptr.add(offset).as_ref().unwrap_unchecked() };
                 let mut backoff = Backoff::new();
-                while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE {
-                    // FIXME: allow active guard as long as this thread activated the guard (split up GUARD_ACTIVE in 2 different guard values)
+                while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE_EXTERNAL {
                     backoff.snooze();
                 }
             }
@@ -819,7 +813,7 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
 #[derive(Debug)]
 pub struct Iter<'a, T: Send + Sync, M: Metadata = ()> {
     thread_local: &'a ThreadLocal<T, M>,
-    raw: RawIter<GUARD_ACTIVE>,
+    raw: RawIter<GUARD_ACTIVE_INTERNAL>,
 }
 
 impl<'a, T: Send + Sync, M: Metadata> Iterator for Iter<'a, T, M> {
@@ -837,7 +831,7 @@ impl<T: Send + Sync, M: Metadata> FusedIterator for Iter<'_, T, M> {}
 /// Mutable iterator over the contents of a `ThreadLocal`.
 pub struct IterMut<'a, T: Send, M: Metadata = ()> {
     thread_local: &'a mut ThreadLocal<T, M>,
-    raw: RawIter<GUARD_ACTIVE>,
+    raw: RawIter<GUARD_ACTIVE_INTERNAL>,
 }
 
 impl<'a, T: Send, M: Metadata> Iterator for IterMut<'a, T, M> {
@@ -887,7 +881,7 @@ impl<T: Send, M: Metadata> FusedIterator for IntoIter<T, M> {}
 #[derive(Debug)]
 pub struct IterMeta<'a, T: Send + Sync, M: Metadata = ()> {
     thread_local: &'a ThreadLocal<T, M>,
-    raw: RawIter<GUARD_ACTIVE>,
+    raw: RawIter<GUARD_ACTIVE_INTERNAL>,
 }
 
 impl<'a, T: Send + Sync, M: Metadata> Iterator for IterMeta<'a, T, M> {
@@ -904,7 +898,7 @@ impl<T: Send + Sync, M: Metadata> FusedIterator for IterMeta<'_, T, M> {}
 /// Mutable iterator over the contents of a `ThreadLocal`.
 pub struct IterMutMeta<'a, T: Send, M: Metadata = ()> {
     thread_local: &'a mut ThreadLocal<T, M>,
-    raw: RawIter<GUARD_ACTIVE>,
+    raw: RawIter<GUARD_ACTIVE_INTERNAL>,
 }
 
 impl<'a, T: Send, M: Metadata> Iterator for IterMutMeta<'a, T, M> {

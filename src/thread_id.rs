@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use crate::{INVALID_THREAD_ID, POINTER_WIDTH};
+use crate::{Entry, INVALID_THREAD_ID, POINTER_WIDTH};
 use once_cell::sync::Lazy;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::cmp::Reverse;
@@ -110,19 +110,19 @@ impl FreeList {
         let mut free_list = self.free_list.lock();
         for entry in free_list.unwrap().iter() {
             unsafe {
-                entry.1.cleanup(*entry.0 as *const ());
+                entry.1.cleanup(*entry.0 as *const Entry<()>);
             }
         }
     }
 }
 
 pub(crate) struct EntryData {
-    pub(crate) drop_fn: unsafe fn(*const ()),
+    pub(crate) drop_fn: unsafe fn(*const Entry<()>),
 }
 
 impl EntryData {
     #[inline]
-    unsafe fn cleanup(&self, data: *const ()) {
+    unsafe fn cleanup(&self, data: *const Entry<()>) {
         let dfn = self.drop_fn;
         unsafe { dfn(data) };
     }

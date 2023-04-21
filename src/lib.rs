@@ -74,7 +74,7 @@ mod unreachable;
 #[allow(deprecated)]
 pub use cached::{CachedIntoIter, CachedIterMut, CachedThreadLocal};
 
-use crate::thread_id::{FreeList, Thread};
+use crate::thread_id::{EntryData, FreeList, Thread};
 use crossbeam_utils::Backoff;
 use smallvec::{smallvec, SmallVec};
 use std::cell::UnsafeCell;
@@ -184,7 +184,6 @@ impl<T, M: Metadata> Entry<T, M> {
                         self.guard.store(GUARD_READY, Ordering::Release);
                         return false;
                     }
-
                     // FIXME: do we have a better way to wait (but be able to see a change in dropping)
                     backoff.snooze();
                 }
@@ -192,8 +191,8 @@ impl<T, M: Metadata> Entry<T, M> {
         }
     }
 
-    pub(crate) unsafe fn cleanup(slf: *const Self) {
-        let slf = unsafe { &*slf };
+    pub(crate) unsafe fn cleanup(slf: *const Entry<()>) {
+        let slf = unsafe { &*slf.cast::<Entry<T, M>>() };
         let mut backoff = Backoff::new();
         while slf
             .guard
@@ -282,6 +281,8 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
 
             unsafe { deallocate_bucket(bucket_ptr, this_bucket_size) };
         }
+
+        bucket_size = 1;
 
         // free alternative buckets
         for (i, bucket) in self.alternative_buckets.iter_mut().enumerate() {
@@ -506,6 +507,10 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         if size_of::<M>() > 0 {
             entry.meta.set_default();
         }
+        let cleanup_fn = Entry::<T, M>::cleanup;
+        unsafe { thread.free_list.as_ref().unwrap_unchecked() }.free_list.lock().unwrap().insert(entry as *const Entry<T, M> as usize, EntryData {
+            drop_fn: unsafe { transmute(cleanup_fn as *const ()) },
+        });
         entry
             .free_list
             .store(thread.free_list.cast_mut(), Ordering::Release);

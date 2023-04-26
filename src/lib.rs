@@ -44,7 +44,7 @@
 //! use std::cell::Cell;
 //! use std::thread;
 //!
-//! let tls = Arc::new(ThreadLocal::new());
+//! let tls = Arc::new(ThreadLocal::<Cell<i32>, ()>::new());
 //!
 //! // Create a bunch of threads to do stuff
 //! for _ in 0..5 {
@@ -57,10 +57,11 @@
 //! }
 //!
 //! // Once all threads are done, collect the counter values and return the
-//! // sum of all thread-local counter values.
+//! // sum of all thread-local counter values, but because all threads are done
+//! // there shouldn't be any entries left.
 //! let tls = Arc::try_unwrap(tls).unwrap();
 //! let total = tls.into_iter().fold(0, |x, y| x + y.get());
-//! assert_eq!(total, 5);
+//! assert_eq!(total, 0);
 //! ```
 
 #![warn(missing_docs)]
@@ -885,7 +886,6 @@ impl<'a, T: Send, M: Metadata> Iterator for IterMut<'a, T, M> {
     }
 }
 
-impl<T: Send, M: Metadata> ExactSizeIterator for IterMut<'_, T, M> {}
 impl<T: Send, M: Metadata> FusedIterator for IterMut<'_, T, M> {}
 
 // Manual impl so we don't call Debug on the ThreadLocal, as doing so would create a reference to
@@ -915,7 +915,6 @@ impl<T: Send, M: Metadata> Iterator for IntoIter<T, M> {
     }
 }
 
-impl<T: Send, M: Metadata> ExactSizeIterator for IntoIter<T, M> {}
 impl<T: Send, M: Metadata> FusedIterator for IntoIter<T, M> {}
 
 /// Iterator over the contents of a `ThreadLocal`.
@@ -955,7 +954,6 @@ impl<'a, T: Send, M: Metadata> Iterator for IterMutMeta<'a, T, M> {
     }
 }
 
-impl<T: Send, M: Metadata> ExactSizeIterator for IterMutMeta<'_, T, M> {}
 impl<T: Send, M: Metadata> FusedIterator for IterMutMeta<'_, T, M> {}
 
 // Manual impl so we don't call Debug on the ThreadLocal, as doing so would create a reference to
@@ -1069,11 +1067,11 @@ mod tests {
 
         let mut tls = Arc::try_unwrap(tls).unwrap();
 
-        /*let mut v = tls.iter().map(|x| **x).collect::<Vec<i32>>();
+        let mut v = tls.iter().map(|x| **x).collect::<Vec<i32>>();
         v.sort_unstable();
         assert_eq!(vec![1, 2, 3], v);
 
-        let mut v = tls.iter_mut().map(|x| **x).collect::<Vec<i32>>();
+        /*let mut v = tls.iter_mut().map(|x| **x).collect::<Vec<i32>>();
         v.sort_unstable();
         assert_eq!(vec![1, 2, 3], v);
 

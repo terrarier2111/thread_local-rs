@@ -147,7 +147,8 @@ impl Drop for ThreadGuard {
         // will go through get_slow which will either panic or
         // initialize a new ThreadGuard.
         unsafe {
-            FREE_LIST.take().unwrap_unchecked().cleanup();
+            FREE_LIST.as_ref().unwrap_unchecked().cleanup();
+            FREE_LIST.take();
         }
         THREAD_ID_MANAGER
             .lock()

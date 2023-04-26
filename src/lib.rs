@@ -85,7 +85,7 @@ use std::mem;
 use std::mem::{size_of, transmute, MaybeUninit};
 use std::panic::UnwindSafe;
 use std::ptr;
-use std::ptr::{null_mut, NonNull};
+use std::ptr::{null_mut, NonNull, null};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::TryLockResult;
 use unreachable::UncheckedResultExt;
@@ -245,6 +245,7 @@ impl<T: Send, M: Metadata> Default for ThreadLocal<T, M> {
 
 impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
     fn drop(&mut self) {
+        println!("start destruct");
         let mut bucket_size = 1;
 
         // Free each non-null bucket
@@ -276,6 +277,7 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
                 let entry = unsafe { &*entry };
                 let mut backoff = Backoff::new();
                 while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE_EXTERNAL {
+                    println!("waiting..");
                     backoff.snooze();
                 }
             }
@@ -304,6 +306,7 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
                 let entry = unsafe { bucket_ptr.add(offset).as_ref().unwrap_unchecked() };
                 let mut backoff = Backoff::new();
                 while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE_EXTERNAL {
+                    println!("waiting..");
                     backoff.snooze();
                 }
             }
@@ -348,6 +351,7 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
 
             unsafe { deallocate_bucket(bucket_ptr, this_bucket_size) };
         }*/
+        println!("end destruct");
     }
 }
 
@@ -611,6 +615,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         Iter {
             thread_local: self,
             raw: RawIter::new(),
+            prev: null(),
         }
     }
 
@@ -624,6 +629,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         IterMut {
             thread_local: self,
             raw: RawIter::new(),
+            prev: null(),
         }
     }
 
@@ -638,6 +644,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         IterMeta {
             thread_local: self,
             raw: RawIter::new(),
+            prev: null(),
         }
     }
 
@@ -651,6 +658,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         IterMutMeta {
             thread_local: self,
             raw: RawIter::new(),
+            prev: null(),
         }
     }
 
@@ -860,6 +868,7 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
 pub struct Iter<'a, T: Send + Sync, M: Metadata = ()> {
     thread_local: &'a ThreadLocal<T, M>,
     raw: RawIter<GUARD_ACTIVE_INTERNAL>,
+    prev: *const Entry<T, M>,
 }
 
 impl<'a, T: Send + Sync, M: Metadata> Iterator for Iter<'a, T, M> {
@@ -868,16 +877,32 @@ impl<'a, T: Send + Sync, M: Metadata> Iterator for Iter<'a, T, M> {
     fn next(&mut self) -> Option<Self::Item> {
         self.raw
             .next(self.thread_local)
-            .map(|entry| unsafe { &*(&*entry.value.get()).as_ptr() })
+            .map(|entry| {
+                if let Some(prev) = unsafe { self.prev.as_ref() } {
+                    prev.guard.store(GUARD_READY, Ordering::Release);
+                }
+                self.prev = entry as *const _;
+
+                unsafe { &*(&*entry.value.get()).as_ptr() }
+            })
     }
 }
 
 impl<T: Send + Sync, M: Metadata> FusedIterator for Iter<'_, T, M> {}
 
+impl<T: Send + Sync, M: Metadata> Drop for Iter<'_, T, M> {
+    fn drop(&mut self) {
+        if let Some(prev) = unsafe { self.prev.as_ref() } {
+            prev.guard.store(GUARD_READY, Ordering::Release);
+        }
+    }
+}
+
 /// Mutable iterator over the contents of a `ThreadLocal`.
 pub struct IterMut<'a, T: Send, M: Metadata = ()> {
     thread_local: &'a mut ThreadLocal<T, M>,
     raw: RawIter<GUARD_ACTIVE_INTERNAL>,
+    prev: *const Entry<T, M>,
 }
 
 impl<'a, T: Send, M: Metadata> Iterator for IterMut<'a, T, M> {
@@ -886,11 +911,26 @@ impl<'a, T: Send, M: Metadata> Iterator for IterMut<'a, T, M> {
     fn next(&mut self) -> Option<&'a mut T> {
         self.raw
             .next_mut(self.thread_local)
-            .map(|entry| unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() })
+            .map(|entry| {
+                if let Some(prev) = unsafe { self.prev.as_ref() } {
+                    prev.guard.store(GUARD_READY, Ordering::Release);
+                }
+                self.prev = entry as *const _;
+
+                unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() }
+            })
     }
 }
 
 impl<T: Send, M: Metadata> FusedIterator for IterMut<'_, T, M> {}
+
+impl<T: Send, M: Metadata> Drop for IterMut<'_, T, M> {
+    fn drop(&mut self) {
+        if let Some(prev) = unsafe { self.prev.as_ref() } {
+            prev.guard.store(GUARD_READY, Ordering::Release);
+        }
+    }
+}
 
 // Manual impl so we don't call Debug on the ThreadLocal, as doing so would create a reference to
 // this thread's value that potentially aliases with a mutable reference we have given out.
@@ -926,6 +966,7 @@ impl<T: Send, M: Metadata> FusedIterator for IntoIter<T, M> {}
 pub struct IterMeta<'a, T: Send + Sync, M: Metadata = ()> {
     thread_local: &'a ThreadLocal<T, M>,
     raw: RawIter<GUARD_ACTIVE_INTERNAL>,
+    prev: *const Entry<T, M>,
 }
 
 impl<'a, T: Send + Sync, M: Metadata> Iterator for IterMeta<'a, T, M> {
@@ -934,15 +975,32 @@ impl<'a, T: Send + Sync, M: Metadata> Iterator for IterMeta<'a, T, M> {
     fn next(&mut self) -> Option<Self::Item> {
         self.raw
             .next(self.thread_local)
-            .map(|entry| (unsafe { &*(&*entry.value.get()).as_ptr() }, &entry.meta))
+            .map(|entry| {
+                if let Some(prev) = unsafe { self.prev.as_ref() } {
+                    prev.guard.store(GUARD_READY, Ordering::Release);
+                }
+                self.prev = entry as *const _;
+
+                (unsafe { &*(&*entry.value.get()).as_ptr() }, &entry.meta)
+            })
     }
 }
+
 impl<T: Send + Sync, M: Metadata> FusedIterator for IterMeta<'_, T, M> {}
+
+impl<T: Send + Sync, M: Metadata> Drop for IterMeta<'_, T, M> {
+    fn drop(&mut self) {
+        if let Some(prev) = unsafe { self.prev.as_ref() } {
+            prev.guard.store(GUARD_READY, Ordering::Release);
+        }
+    }
+}
 
 /// Mutable iterator over the contents of a `ThreadLocal`.
 pub struct IterMutMeta<'a, T: Send, M: Metadata = ()> {
     thread_local: &'a mut ThreadLocal<T, M>,
     raw: RawIter<GUARD_ACTIVE_INTERNAL>,
+    prev: *const Entry<T, M>,
 }
 
 impl<'a, T: Send, M: Metadata> Iterator for IterMutMeta<'a, T, M> {
@@ -950,6 +1008,11 @@ impl<'a, T: Send, M: Metadata> Iterator for IterMutMeta<'a, T, M> {
 
     fn next(&mut self) -> Option<(&'a mut T, &'a M)> {
         self.raw.next_mut(self.thread_local).map(move |entry| {
+            if let Some(prev) = unsafe { self.prev.as_ref() } {
+                prev.guard.store(GUARD_READY, Ordering::Release);
+            }
+            self.prev = entry as *const _;
+
             (
                 unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() },
                 unsafe { &(&*entry).meta },
@@ -959,6 +1022,14 @@ impl<'a, T: Send, M: Metadata> Iterator for IterMutMeta<'a, T, M> {
 }
 
 impl<T: Send, M: Metadata> FusedIterator for IterMutMeta<'_, T, M> {}
+
+impl<T: Send, M: Metadata> Drop for IterMutMeta<'_, T, M> {
+    fn drop(&mut self) {
+        if let Some(prev) = unsafe { self.prev.as_ref() } {
+            prev.guard.store(GUARD_READY, Ordering::Release);
+        }
+    }
+}
 
 // Manual impl so we don't call Debug on the ThreadLocal, as doing so would create a reference to
 // this thread's value that potentially aliases with a mutable reference we have given out.

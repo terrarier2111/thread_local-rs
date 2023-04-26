@@ -106,6 +106,7 @@ impl FreeList {
     }
 
     fn cleanup(&self) {
+        println!("start cleaning up...");
         self.dropping.store(true, Ordering::Release);
         let mut free_list = self.free_list.lock();
         for entry in free_list.unwrap().iter() {
@@ -113,6 +114,7 @@ impl FreeList {
                 entry.1.cleanup(*entry.0 as *const Entry<()>);
             }
         }
+        println!("cleaned up!");
     }
 }
 

@@ -312,7 +312,7 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
         bucket_size = 1;
 
         // Free each non-null bucket
-        for (i, bucket) in self.buckets.iter_mut().enumerate() {
+        /*for (i, bucket) in self.buckets.iter_mut().enumerate() {
             let bucket_ptr = *bucket.get_mut();
 
             let this_bucket_size = bucket_size;
@@ -347,7 +347,7 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
             }
 
             unsafe { deallocate_bucket(bucket_ptr, this_bucket_size) };
-        }
+        }*/
     }
 }
 
@@ -756,7 +756,6 @@ impl<T: Send + UnwindSafe, M: Metadata> UnwindSafe for ThreadLocal<T, M> {}
 // FIXME: support alternative_entry
 #[derive(Debug)]
 struct RawIter<const NEW_GUARD: usize> {
-    yielded: usize,
     bucket: usize,
     bucket_size: usize,
     index: usize,
@@ -766,7 +765,6 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
     #[inline]
     fn new() -> Self {
         Self {
-            yielded: 0,
             bucket: 0,
             bucket_size: 1,
             index: 0,
@@ -785,16 +783,23 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
                 return None;
             }
 
+            println!("iter outer!");
+
             while self.index < self.bucket_size {
+                println!("iter simple!");
                 let entry = unsafe { &*bucket.add(self.index) };
                 self.index += 1;
-                if entry
+                match entry
                     .guard
-                    .compare_exchange(GUARD_READY, NEW_GUARD, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    self.yielded += 1;
-                    return Some(entry);
+                    .compare_exchange(GUARD_READY, NEW_GUARD, Ordering::AcqRel, Ordering::Relaxed) {
+                    Ok(_) => {
+                        return Some(entry);
+                    }
+                    Err(guard) => {
+                        if guard == GUARD_UNINIT {
+                            return None;
+                        }
+                    }
                 }
             }
 
@@ -825,11 +830,10 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        self.yielded += 1;
                         return Some((entry as *const Entry<T, M>).cast_mut());
                     }
-                    Err(err) => {
-                        if err == GUARD_UNINIT {
+                    Err(guard) => {
+                        if guard == GUARD_UNINIT {
                             return None;
                         }
                     }
@@ -970,7 +974,7 @@ fn allocate_bucket<T, M: Metadata>(size: usize) -> *mut Entry<T, M> {
     Box::into_raw(
         (0..size)
             .map(|_| Entry::<T, M> {
-                guard: Default::default(),
+                guard: AtomicUsize::new(GUARD_UNINIT),
                 alternative_entry: AtomicPtr::new(null_mut()),
                 free_list: Default::default(),
                 meta: Default::default(),
@@ -1067,7 +1071,10 @@ mod tests {
 
         let mut tls = Arc::try_unwrap(tls).unwrap();
 
-        let mut v = tls.iter().map(|x| **x).collect::<Vec<i32>>();
+        let mut v = tls.iter().map(|x| {
+            println!("found: {}", x);
+            **x
+        }).collect::<Vec<i32>>();
         v.sort_unstable();
         assert_eq!(vec![1, 2, 3], v);
 

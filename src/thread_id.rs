@@ -143,13 +143,15 @@ struct ThreadGuard;
 
 impl Drop for ThreadGuard {
     fn drop(&mut self) {
+        unsafe {
+            // first clean up all entries in the freelist
+            FREE_LIST.as_ref().unwrap_unchecked().cleanup();
+            // ... then clean up the freelist itself.
+            FREE_LIST.take();
+        }
         // Release the thread ID. Any further accesses to the thread ID
         // will go through get_slow which will either panic or
         // initialize a new ThreadGuard.
-        unsafe {
-            FREE_LIST.as_ref().unwrap_unchecked().cleanup();
-            FREE_LIST.take();
-        }
         THREAD_ID_MANAGER
             .lock()
             .unwrap()

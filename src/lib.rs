@@ -951,6 +951,7 @@ impl<T: Send, M: Metadata> Iterator for IntoIter<T, M> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
+        // FIXME: remove this entry from the freelist
         self.raw
             .next_mut(&mut self.thread_local)
             .map(|entry| unsafe {

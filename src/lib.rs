@@ -951,12 +951,42 @@ impl<T: Send, M: Metadata> Iterator for IntoIter<T, M> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
-        // FIXME: remove this entry from the freelist
-        self.raw
-            .next_mut(&mut self.thread_local)
-            .map(|entry| unsafe {
-                mem::replace(&mut *(&mut *entry).value.get(), MaybeUninit::uninit()).assume_init()
-            })
+        loop {
+            match self.raw
+                .next_mut(&mut self.thread_local) {
+                None => return None,
+                Some(entry) => {
+                    // remove the entry from the freelist as we are freeing it already.
+
+                    // FIXME: reduce code duplication with detachment helpers of entries from threads in `Entry`
+                    let free_list = unsafe { &*entry }.free_list.load(Ordering::Acquire);
+
+                    let mut backoff = Backoff::new();
+                    loop {
+                        match unsafe { &*free_list }.free_list.try_lock() { // FIXME: this can deref an already dealloced piece of memory.
+                            Ok(mut guard) => {
+                                // we got the lock and can now remove our entry from the free list
+                                guard.remove(&(entry as usize));
+                                let ret = unsafe {
+                                    mem::replace(&mut *(&mut *entry).value.get(), MaybeUninit::uninit()).assume_init()
+                                };
+                                return Some(ret);
+                            }
+                            Err(_) => {
+                                // check if the thread declared that it was dropping, if so give up and try finding a new entry
+                                if unsafe { &*free_list }.dropping.load(Ordering::Acquire) {
+                                    unsafe { &*entry }.guard.store(GUARD_READY, Ordering::Release);
+                                    // try finding a new entry
+                                    break;
+                                }
+                                // FIXME: do we have a better way to wait (but be able to see a change in dropping)
+                                backoff.snooze();
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

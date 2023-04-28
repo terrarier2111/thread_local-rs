@@ -208,8 +208,9 @@ impl<T, M: Metadata> Entry<T, M> {
             backoff.snooze();
         }
         // clean up the value as we already know at this point that there is a value present
+        let val = unsafe { &mut *slf.value.get() }.as_mut_ptr();
         unsafe {
-            ptr::drop_in_place(slf.value.get());
+            ptr::drop_in_place(val);
         }
         // signal that there is no thread associated with the entry anymore.
         slf.free_list.store(null_mut(), Ordering::Release);
@@ -221,8 +222,9 @@ impl<T, M: Metadata> Drop for Entry<T, M> {
     fn drop(&mut self) {
         let guard = *self.guard.get_mut();
         if guard == GUARD_READY || guard == GUARD_ACTIVE_INTERNAL {
+            let val = unsafe { &mut *self.value.get() }.as_mut_ptr();
             unsafe {
-                ptr::drop_in_place((*self.value.get()).as_mut_ptr());
+                ptr::drop_in_place(val);
             }
         }
     }
@@ -315,7 +317,7 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
         bucket_size = 1;
 
         // Free each non-null bucket
-        /*for (i, bucket) in self.buckets.iter_mut().enumerate() {
+        for (i, bucket) in self.buckets.iter_mut().enumerate() {
             let bucket_ptr = *bucket.get_mut();
 
             let this_bucket_size = bucket_size;
@@ -350,7 +352,7 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
             }
 
             unsafe { deallocate_bucket(bucket_ptr, this_bucket_size) };
-        }*/
+        }
         println!("end destruct");
     }
 }

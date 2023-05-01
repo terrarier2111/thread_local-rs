@@ -468,10 +468,17 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         }
         let entry = unsafe { &*bucket_ptr.add(thread.index) };
         let free_list = entry.free_list.load(Ordering::Acquire);
+        // check if the entry is usable (it has an init value and it's not a pseudo-present value)
         if free_list.cast_const() == thread.free_list {
             Some(unsafe { &*(&*entry.value.get()).as_ptr() })
         } else {
-            None
+            let alt = entry.alternative_entry.load(Ordering::Acquire);
+            // check if the entry has an alternative entry (and thus a pseudo-present value)
+            if let Some(alt) = unsafe { alt.as_ref() } {
+                Some(unsafe { &*(&*alt.value.get()).as_ptr() })
+            } else {
+                None
+            }
         }
     }
 
@@ -484,10 +491,17 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
 
         let entry = unsafe { &*bucket_ptr.add(thread.index) };
         let free_list = entry.free_list.load(Ordering::Acquire);
+        // check if the entry is usable (it has an init value and it's not a pseudo-present value)
         if free_list.cast_const() == thread.free_list {
             Some(&entry.meta)
         } else {
-            None
+            let alt = entry.alternative_entry.load(Ordering::Acquire);
+            // check if the entry has an alternative entry (and thus a pseudo-present value)
+            if let Some(alt) = unsafe { alt.as_ref() } {
+                Some(&alt.meta)
+            } else {
+                None
+            }
         }
     }
 
@@ -500,13 +514,21 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
 
         let entry = unsafe { &*bucket_ptr.add(thread.index) };
         let free_list = entry.free_list.load(Ordering::Acquire);
+        // check if the entry is usable (it has an init value and it's not a pseudo-present value)
         if free_list.cast_const() == thread.free_list {
             Some((unsafe { &*(&*entry.value.get()).as_ptr() }, &entry.meta))
         } else {
-            None
+            let alt = entry.alternative_entry.load(Ordering::Acquire);
+            // check if the entry has an alternative entry (and thus a pseudo-present value)
+            if let Some(alt) = unsafe { alt.as_ref() } {
+                Some((unsafe { &*(&*alt.value.get()).as_ptr() }, &alt.meta))
+            } else {
+                None
+            }
         }
     }
 
+    // FIXME: support insertion in alternative entries!
     #[cold]
     fn insert(&self, data: T) -> &T {
         let thread = thread_id::get();
@@ -562,6 +584,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         unsafe { &*(&*value_ptr).as_ptr() }
     }
 
+    // FIXME: support insertion in alternative entries!
     #[cold]
     fn insert_with_meta<F: FnOnce(*const M) -> T, FM: FnOnce(&M)>(&self, f: F, fm: FM) -> (&T, &M) {
         let thread = thread_id::get();
@@ -793,10 +816,7 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
                 return None;
             }
 
-            println!("iter outer!");
-
             while self.index < self.bucket_size {
-                println!("iter simple!");
                 let entry = unsafe { &*bucket.add(self.index) };
                 self.index += 1;
                 match entry.guard.compare_exchange(

@@ -101,6 +101,9 @@ const POINTER_WIDTH: u8 = 64;
 /// The total number of buckets stored in each thread local.
 const BUCKETS: usize = (POINTER_WIDTH + 1) as usize;
 
+// FIXME: support not making a freed entry available immediately but holding it back until it gets
+// FIXME: released manually.
+
 /// Thread-local variable wrapper
 ///
 /// See the [module-level documentation](index.html) for more.
@@ -173,7 +176,8 @@ impl<T, M: Metadata> Entry<T, M> {
 
         let mut backoff = Backoff::new();
         loop {
-            match unsafe { &*free_list }.free_list.try_lock() { // FIXME: this can deref an already dealloced piece of memory.
+            match unsafe { &*free_list }.free_list.try_lock() {
+                // FIXME: this can deref an already dealloced piece of memory.
                 Ok(mut guard) => {
                     // we got the lock and can now remove our entry from the free list
                     guard.remove(&(self as *const Entry<T, M> as usize));
@@ -247,7 +251,6 @@ impl<T: Send, M: Metadata> Default for ThreadLocal<T, M> {
 
 impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
     fn drop(&mut self) {
-        println!("start destruct");
         let mut bucket_size = 1;
 
         // Free each non-null bucket
@@ -279,7 +282,6 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
                 let entry = unsafe { &*entry };
                 let mut backoff = Backoff::new();
                 while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE_EXTERNAL {
-                    println!("waiting..");
                     backoff.snooze();
                 }
             }
@@ -308,7 +310,6 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
                 let entry = unsafe { bucket_ptr.add(offset).as_ref().unwrap_unchecked() };
                 let mut backoff = Backoff::new();
                 while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE_EXTERNAL {
-                    println!("waiting..");
                     backoff.snooze();
                 }
             }
@@ -353,7 +354,6 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
 
             unsafe { deallocate_bucket(bucket_ptr, this_bucket_size) };
         }
-        println!("end destruct");
     }
 }
 
@@ -395,7 +395,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             }
         }
 
-        ThreadLocal {
+        Self {
             // Safety: AtomicPtr has the same representation as a pointer and arrays have the same
             // representation as a sequence of their inner type.
             buckets: unsafe { transmute(buckets) },
@@ -466,15 +466,12 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         if bucket_ptr.is_null() {
             return None;
         }
-        unsafe {
-            let entry = &*bucket_ptr.add(thread.index);
-            // Read without atomic operations as only this thread can set the value.
-            let free_list = entry.free_list.load(Ordering::Acquire);
-            if free_list.cast_const() == thread.free_list {
-                Some(&*(&*entry.value.get()).as_ptr())
-            } else {
-                None
-            }
+        let entry = unsafe { &*bucket_ptr.add(thread.index) };
+        let free_list = entry.free_list.load(Ordering::Acquire);
+        if free_list.cast_const() == thread.free_list {
+            Some(unsafe { &*(&*entry.value.get()).as_ptr() })
+        } else {
+            None
         }
     }
 
@@ -484,15 +481,13 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         if bucket_ptr.is_null() {
             return None;
         }
-        unsafe {
-            let entry = &*bucket_ptr.add(thread.index);
-            // Read without atomic operations as only this thread can set the value.
-            let free_list = entry.free_list.load(Ordering::Acquire);
-            if free_list.cast_const() == thread.free_list {
-                Some(&entry.meta)
-            } else {
-                None
-            }
+
+        let entry = unsafe { &*bucket_ptr.add(thread.index) };
+        let free_list = entry.free_list.load(Ordering::Acquire);
+        if free_list.cast_const() == thread.free_list {
+            Some(&entry.meta)
+        } else {
+            None
         }
     }
 
@@ -502,15 +497,13 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         if bucket_ptr.is_null() {
             return None;
         }
-        unsafe {
-            let entry = &*bucket_ptr.add(thread.index);
-            // Read without atomic operations as only this thread can set the value.
-            let free_list = entry.free_list.load(Ordering::Acquire);
-            if free_list.cast_const() == thread.free_list {
-                Some((&*(&*entry.value.get()).as_ptr(), &entry.meta))
-            } else {
-                None
-            }
+
+        let entry = unsafe { &*bucket_ptr.add(thread.index) };
+        let free_list = entry.free_list.load(Ordering::Acquire);
+        if free_list.cast_const() == thread.free_list {
+            Some((unsafe { &*(&*entry.value.get()).as_ptr() }, &entry.meta))
+        } else {
+            None
         }
     }
 
@@ -551,9 +544,16 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             entry.meta.set_default();
         }
         let cleanup_fn = Entry::<T, M>::cleanup;
-        unsafe { thread.free_list.as_ref().unwrap_unchecked() }.free_list.lock().unwrap().insert(entry as *const Entry<T, M> as usize, EntryData {
-            drop_fn: unsafe { transmute(cleanup_fn as *const ()) },
-        });
+        unsafe { thread.free_list.as_ref().unwrap_unchecked() }
+            .free_list
+            .lock()
+            .unwrap()
+            .insert(
+                entry as *const Entry<T, M> as usize,
+                EntryData {
+                    drop_fn: unsafe { transmute(cleanup_fn as *const ()) },
+                },
+            );
         entry
             .free_list
             .store(thread.free_list.cast_mut(), Ordering::Release);
@@ -799,9 +799,12 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
                 println!("iter simple!");
                 let entry = unsafe { &*bucket.add(self.index) };
                 self.index += 1;
-                match entry
-                    .guard
-                    .compare_exchange(GUARD_READY, NEW_GUARD, Ordering::AcqRel, Ordering::Relaxed) {
+                match entry.guard.compare_exchange(
+                    GUARD_READY,
+                    NEW_GUARD,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => {
                         return Some(entry);
                     }
@@ -877,16 +880,14 @@ impl<'a, T: Send + Sync, M: Metadata> Iterator for Iter<'a, T, M> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.raw
-            .next(self.thread_local)
-            .map(|entry| {
-                if let Some(prev) = unsafe { self.prev.as_ref() } {
-                    prev.guard.store(GUARD_READY, Ordering::Release);
-                }
-                self.prev = entry as *const _;
+        self.raw.next(self.thread_local).map(|entry| {
+            if let Some(prev) = unsafe { self.prev.as_ref() } {
+                prev.guard.store(GUARD_READY, Ordering::Release);
+            }
+            self.prev = entry as *const _;
 
-                unsafe { &*(&*entry.value.get()).as_ptr() }
-            })
+            unsafe { &*(&*entry.value.get()).as_ptr() }
+        })
     }
 }
 
@@ -911,16 +912,14 @@ impl<'a, T: Send, M: Metadata> Iterator for IterMut<'a, T, M> {
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<&'a mut T> {
-        self.raw
-            .next_mut(self.thread_local)
-            .map(|entry| {
-                if let Some(prev) = unsafe { self.prev.as_ref() } {
-                    prev.guard.store(GUARD_READY, Ordering::Release);
-                }
-                self.prev = entry as *const _;
+        self.raw.next_mut(self.thread_local).map(|entry| {
+            if let Some(prev) = unsafe { self.prev.as_ref() } {
+                prev.guard.store(GUARD_READY, Ordering::Release);
+            }
+            self.prev = entry as *const _;
 
-                unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() }
-            })
+            unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() }
+        })
     }
 }
 
@@ -954,8 +953,7 @@ impl<T: Send, M: Metadata> Iterator for IntoIter<T, M> {
 
     fn next(&mut self) -> Option<T> {
         loop {
-            match self.raw
-                .next_mut(&mut self.thread_local) {
+            match self.raw.next_mut(&mut self.thread_local) {
                 None => return None,
                 Some(entry) => {
                     // remove the entry from the freelist as we are freeing it already.
@@ -965,19 +963,26 @@ impl<T: Send, M: Metadata> Iterator for IntoIter<T, M> {
 
                     let mut backoff = Backoff::new();
                     loop {
-                        match unsafe { &*free_list }.free_list.try_lock() { // FIXME: this can deref an already dealloced piece of memory.
+                        match unsafe { &*free_list }.free_list.try_lock() {
+                            // FIXME: this can deref an already dealloced piece of memory.
                             Ok(mut guard) => {
                                 // we got the lock and can now remove our entry from the free list
                                 guard.remove(&(entry as usize));
                                 let ret = unsafe {
-                                    mem::replace(&mut *(&mut *entry).value.get(), MaybeUninit::uninit()).assume_init()
+                                    mem::replace(
+                                        &mut *(&mut *entry).value.get(),
+                                        MaybeUninit::uninit(),
+                                    )
+                                    .assume_init()
                                 };
                                 return Some(ret);
                             }
                             Err(_) => {
                                 // check if the thread declared that it was dropping, if so give up and try finding a new entry
                                 if unsafe { &*free_list }.dropping.load(Ordering::Acquire) {
-                                    unsafe { &*entry }.guard.store(GUARD_READY, Ordering::Release);
+                                    unsafe { &*entry }
+                                        .guard
+                                        .store(GUARD_READY, Ordering::Release);
                                     // try finding a new entry
                                     break;
                                 }
@@ -1006,16 +1011,14 @@ impl<'a, T: Send + Sync, M: Metadata> Iterator for IterMeta<'a, T, M> {
     type Item = (&'a T, &'a M);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.raw
-            .next(self.thread_local)
-            .map(|entry| {
-                if let Some(prev) = unsafe { self.prev.as_ref() } {
-                    prev.guard.store(GUARD_READY, Ordering::Release);
-                }
-                self.prev = entry as *const _;
+        self.raw.next(self.thread_local).map(|entry| {
+            if let Some(prev) = unsafe { self.prev.as_ref() } {
+                prev.guard.store(GUARD_READY, Ordering::Release);
+            }
+            self.prev = entry as *const _;
 
-                (unsafe { &*(&*entry.value.get()).as_ptr() }, &entry.meta)
-            })
+            (unsafe { &*(&*entry.value.get()).as_ptr() }, &entry.meta)
+        })
     }
 }
 
@@ -1175,10 +1178,13 @@ mod tests {
 
         let mut tls = Arc::try_unwrap(tls).unwrap();
 
-        let mut v = tls.iter().map(|x| {
-            println!("found: {}", x);
-            **x
-        }).collect::<Vec<i32>>();
+        let mut v = tls
+            .iter()
+            .map(|x| {
+                println!("found: {}", x);
+                **x
+            })
+            .collect::<Vec<i32>>();
         v.sort_unstable();
         assert_eq!(vec![1, 2, 3], v);
 

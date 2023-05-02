@@ -220,9 +220,11 @@ impl<T, M: Metadata> Entry<T, M> {
         unsafe {
             ptr::drop_in_place(val);
         }
+
+        // check if this entry is an alternative entry and free it if so
+
+        // FIXME: only do this if auto-freeing entries is okay
         if let Some(tid_manager) = slf.tid_manager.as_ref() {
-            // FIXME: check if this entry is an alternative entry and free it if so.
-            // FIXME: but only do this if auto-freeing entries is okay.
             tid_manager.lock().unwrap().free(); // FIXME: how do we know this id?
 
         }

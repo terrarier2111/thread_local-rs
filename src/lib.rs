@@ -130,6 +130,7 @@ const GUARD_FREE_MANUALLY: usize = 5;
 struct Entry<T, M: Metadata = ()> {
     /// this will be null if this entry isn't an alternative entry.
     tid_manager: *const Mutex<ThreadIdManager>,
+    id: usize,
     guard: AtomicUsize,
     alternative_entry: AtomicPtr<Entry<T, M>>,
     free_list: AtomicPtr<FreeList>,
@@ -225,8 +226,7 @@ impl<T, M: Metadata> Entry<T, M> {
 
         // FIXME: only do this if auto-freeing entries is okay
         if let Some(tid_manager) = slf.tid_manager.as_ref() {
-            tid_manager.lock().unwrap().free(); // FIXME: how do we know this id?
-
+            tid_manager.lock().unwrap().free(slf.id);
         }
         // signal that there is no thread associated with the entry anymore.
         // this also disables the cleanup of this entry in the `normal` entry
@@ -390,7 +390,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         let mut buckets = [null_mut(); BUCKETS];
         let mut bucket_size = 1;
         for (i, bucket) in buckets[..allocated_buckets].iter_mut().enumerate() {
-            *bucket = allocate_bucket::<false, T, M>(bucket_size, tid_manager.as_ref() as *const _);
+            *bucket = allocate_bucket::<false, T, M>(bucket_size, tid_manager.as_ref() as *const _, 0);
 
             if i != 0 {
                 bucket_size <<= 1;
@@ -403,7 +403,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             .iter_mut()
             .enumerate()
         {
-            *bucket = allocate_bucket::<true, T, M>(bucket_size, tid_manager.as_ref() as *const _);
+            *bucket = allocate_bucket::<true, T, M>(bucket_size, tid_manager.as_ref() as *const _, i);
 
             if i != 0 {
                 bucket_size <<= 1;
@@ -553,7 +553,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket::<false, T, M>(thread.bucket_size(), self.alternative_entry_ids.as_ref() as *const _);
+            let new_bucket = allocate_bucket::<false, T, M>(thread.bucket_size(), self.alternative_entry_ids.as_ref() as *const _, 0);
 
             match bucket_atomic_ptr.compare_exchange(
                 null_mut(),
@@ -617,7 +617,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket::<false, T, M>(thread.bucket_size(), self.alternative_entry_ids.as_ref() as *const _);
+            let new_bucket = allocate_bucket::<false, T, M>(thread.bucket_size(), self.alternative_entry_ids.as_ref() as *const _, 0);
 
             match bucket_atomic_ptr.compare_exchange(
                 null_mut(),
@@ -662,7 +662,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket::<true, T, M>(bucket_size, self.alternative_entry_ids.as_ref() as *const _);
+            let new_bucket = allocate_bucket::<true, T, M>(bucket_size, self.alternative_entry_ids.as_ref() as *const _, bucket);
 
             match bucket_atomic_ptr.compare_exchange(
                 null_mut(),
@@ -1155,15 +1155,16 @@ impl<'a, T: Send + fmt::Debug, M: Metadata> fmt::Debug for IterMutMeta<'a, T, M>
     }
 }
 
-fn allocate_bucket<const ALTERNATIVE: bool, T, M: Metadata>(size: usize, tid_manager: *const Mutex<ThreadIdManager>) -> *mut Entry<T, M> {
+fn allocate_bucket<const ALTERNATIVE: bool, T, M: Metadata>(size: usize, tid_manager: *const Mutex<ThreadIdManager>, bucket: usize) -> *mut Entry<T, M> {
     Box::into_raw(
         (0..size)
-            .map(|_| Entry::<T, M> {
+            .map(|n| Entry::<T, M> {
                 tid_manager: if ALTERNATIVE {
                     tid_manager
                 } else {
                     null()
                 },
+                id: if ALTERNATIVE { n ^ (1 << bucket.saturating_sub(1)) } else { 0 }, // FIXME: do we need this sub?
                 guard: AtomicUsize::new(GUARD_UNINIT),
                 alternative_entry: AtomicPtr::new(null_mut()),
                 free_list: Default::default(),

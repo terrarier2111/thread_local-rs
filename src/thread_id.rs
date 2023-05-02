@@ -18,18 +18,20 @@ use std::usize;
 /// Thread ID manager which allocates thread IDs. It attempts to aggressively
 /// reuse thread IDs where possible to avoid cases where a ThreadLocal grows
 /// indefinitely when it is used by many short-lived threads.
-struct ThreadIdManager {
+pub(crate) struct ThreadIdManager {
     free_from: usize,
     free_list: BinaryHeap<Reverse<usize>>,
 }
+
 impl ThreadIdManager {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             free_from: 0,
             free_list: BinaryHeap::new(),
         }
     }
-    fn alloc(&mut self) -> usize {
+
+    pub(crate) fn alloc(&mut self) -> usize {
         if let Some(id) = self.free_list.pop() {
             id.0
         } else {
@@ -41,22 +43,14 @@ impl ThreadIdManager {
             id
         }
     }
-    fn free(&mut self, id: usize) {
+
+    pub(crate) fn free(&mut self, id: usize) {
         self.free_list.push(Reverse(id));
     }
 }
+
 static THREAD_ID_MANAGER: Lazy<Mutex<ThreadIdManager>> =
     Lazy::new(|| Mutex::new(ThreadIdManager::new()));
-
-fn thread_id() -> usize {
-    let tid = thread_id::get();
-
-    if tid == INVALID_THREAD_ID {
-        abort();
-    }
-
-    tid
-}
 
 /// Data which is unique to the current thread while it is running.
 /// A thread ID may be reused after a thread exits.
@@ -72,12 +66,12 @@ pub(crate) struct Thread {
 }
 
 impl Thread {
-    fn new(id: usize, free_list: *const FreeList) -> Thread {
+    fn new(id: usize, free_list: *const FreeList) -> Self {
         let bucket = usize::from(POINTER_WIDTH) - id.leading_zeros() as usize;
         let bucket_size = 1 << bucket.saturating_sub(1);
         let index = if id != 0 { id ^ bucket_size } else { 0 };
 
-        Thread {
+        Self {
             id,
             bucket,
             index,
@@ -90,6 +84,16 @@ impl Thread {
     pub(crate) fn bucket_size(&self) -> usize {
         1 << self.bucket.saturating_sub(1)
     }
+}
+
+/// returns the bucket, bucket size and index of the given id
+#[inline]
+pub(crate) fn id_into_parts(id: usize) -> (usize, usize, usize) {
+    let bucket = usize::from(POINTER_WIDTH) - id.leading_zeros() as usize;
+    let bucket_size = 1 << bucket.saturating_sub(1);
+    let index = if id != 0 { id ^ bucket_size } else { 0 };
+
+    (bucket, bucket_size, index)
 }
 
 pub(crate) struct FreeList {
@@ -106,7 +110,6 @@ impl FreeList {
     }
 
     fn cleanup(&self) {
-        println!("start cleaning up...");
         self.dropping.store(true, Ordering::Release);
         let mut free_list = self.free_list.lock();
         for entry in free_list.unwrap().iter() {
@@ -114,7 +117,6 @@ impl FreeList {
                 entry.1.cleanup(*entry.0 as *const Entry<()>);
             }
         }
-        println!("cleaned up!");
     }
 }
 
@@ -141,7 +143,7 @@ static mut FREE_LIST: Option<FreeList> = None;
 thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard }; }
 
 // Guard to ensure the thread ID is released on thread exit.
-struct ThreadGuard;
+struct ThreadGuard; // FIXME: maybe add a field `discharged` to indicate whether the thread id should be freed or kept in-use
 
 impl Drop for ThreadGuard {
     fn drop(&mut self) {

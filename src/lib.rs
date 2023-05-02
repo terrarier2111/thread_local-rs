@@ -75,7 +75,7 @@ mod unreachable;
 #[allow(deprecated)]
 pub use cached::{CachedIntoIter, CachedIterMut, CachedThreadLocal};
 
-use crate::thread_id::{EntryData, FreeList, Thread};
+use crate::thread_id::{EntryData, FreeList, Thread, ThreadIdManager};
 use crossbeam_utils::Backoff;
 use smallvec::{smallvec, SmallVec};
 use std::cell::UnsafeCell;
@@ -87,7 +87,7 @@ use std::panic::UnwindSafe;
 use std::ptr;
 use std::ptr::{null_mut, NonNull, null};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::TryLockResult;
+use std::sync::{Mutex, TryLockResult};
 use unreachable::UncheckedResultExt;
 
 // Use usize::BITS once it has stabilized and the MSRV has been bumped.
@@ -113,6 +113,7 @@ pub struct ThreadLocal<T: Send, M: Metadata = ()> {
     buckets: [AtomicPtr<Entry<T, M>>; BUCKETS],
 
     alternative_buckets: [AtomicPtr<Entry<T, M>>; BUCKETS],
+    alternative_entry_ids: Mutex<ThreadIdManager>,
 }
 
 const INVALID_THREAD_ID: usize = usize::MAX;
@@ -125,6 +126,7 @@ const GUARD_READY: usize = 2;
 // the guard is currently active and anybody wanting to use it has to wait
 const GUARD_ACTIVE_INTERNAL: usize = 3;
 const GUARD_ACTIVE_EXTERNAL: usize = 4;
+const GUARD_FREE_MANUALLY: usize = 5;
 
 // FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
 struct Entry<T, M: Metadata = ()> {
@@ -145,8 +147,10 @@ impl<T, M: Metadata> Entry<T, M> {
         let alt = self.alternative_entry.load(Ordering::Acquire);
 
         if let Some(alt) = alt.as_ref() {
-            if !alt.try_detach_thread_locally() {
-                cleanup.push(alt as *const _);
+            if !alt.free_list.load(Ordering::Acquire).is_null() {
+                if !alt.try_detach_thread_locally() {
+                    cleanup.push(alt as *const _);
+                }
             }
         }
 
@@ -217,6 +221,8 @@ impl<T, M: Metadata> Entry<T, M> {
             ptr::drop_in_place(val);
         }
         // signal that there is no thread associated with the entry anymore.
+        // this also disables the cleanup of this entry in the `normal` entry
+        // on destruction of the central struct.
         slf.free_list.store(null_mut(), Ordering::Release);
         slf.guard.store(GUARD_EMPTY, Ordering::Release); // FIXME: is it okay to store GUARD_EMPTY even if there is still an alternative_entry present?
     }
@@ -400,6 +406,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             // representation as a sequence of their inner type.
             buckets: unsafe { transmute(buckets) },
             alternative_buckets: unsafe { transmute(alternative_buckets) },
+            alternative_entry_ids: Mutex::new(ThreadIdManager::new()),
         }
     }
 
@@ -559,7 +566,15 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         };
 
         // Insert the new element into the bucket
-        let entry = unsafe { &*bucket_ptr.add(thread.index) };
+        let mut entry = unsafe { &*bucket_ptr.add(thread.index) };
+
+        if entry.guard.load(Ordering::Acquire) == GUARD_FREE_MANUALLY {
+            // FIXME: do we have to support traversing alternative entries recursively?
+            let alt = self.acquire_alternative_entry();
+            entry.alternative_entry.store(alt.cast_mut(), Ordering::Release);
+            entry = unsafe { &*alt };
+        }
+
         let value_ptr = entry.value.get();
         unsafe { value_ptr.write(MaybeUninit::new(data)) };
         if size_of::<M>() > 0 {
@@ -627,6 +642,40 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         entry.guard.store(GUARD_READY, Ordering::Release);
 
         (unsafe { &*(&*value_ptr).as_ptr() }, &entry.meta)
+    }
+
+    fn acquire_alternative_entry(&self) -> *const Entry<T, M> {
+        let id = self.alternative_entry_ids.lock().unwrap().alloc();
+        let (bucket, bucket_size, index) = thread_id::id_into_parts(id);
+
+        let bucket_atomic_ptr = unsafe { self.buckets.get_unchecked(bucket) };
+        let bucket_ptr: *const _ = bucket_atomic_ptr.load(Ordering::Acquire);
+
+        // If the bucket doesn't already exist, we need to allocate it
+        let bucket_ptr = if bucket_ptr.is_null() {
+            let new_bucket = allocate_bucket(bucket_size);
+
+            match bucket_atomic_ptr.compare_exchange(
+                null_mut(),
+                new_bucket,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => new_bucket,
+                // If the bucket value changed (from null), that means
+                // another thread stored a new bucket before we could,
+                // and we can free our bucket and use that one instead
+                Err(bucket_ptr) => {
+                    unsafe { deallocate_bucket(new_bucket, bucket_size) }
+                    bucket_ptr
+                }
+            }
+        } else {
+            bucket_ptr
+        };
+
+        // Insert the new element into the bucket
+        unsafe { bucket_ptr.add(index) }
     }
 
     /// Returns an iterator over the local values of all threads in unspecified

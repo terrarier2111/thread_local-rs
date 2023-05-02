@@ -113,10 +113,8 @@ pub struct ThreadLocal<T: Send, M: Metadata = ()> {
     buckets: [AtomicPtr<Entry<T, M>>; BUCKETS],
 
     alternative_buckets: [AtomicPtr<Entry<T, M>>; BUCKETS],
-    alternative_entry_ids: Mutex<ThreadIdManager>,
+    alternative_entry_ids: Box<Mutex<ThreadIdManager>>,
 }
-
-const INVALID_THREAD_ID: usize = usize::MAX;
 
 const GUARD_UNINIT: usize = 0;
 // there is nothing to guard, so the guard can't be used
@@ -130,6 +128,8 @@ const GUARD_FREE_MANUALLY: usize = 5;
 
 // FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
 struct Entry<T, M: Metadata = ()> {
+    /// this will be null if this entry isn't an alternative entry.
+    tid_manager: *const Mutex<ThreadIdManager>,
     guard: AtomicUsize,
     alternative_entry: AtomicPtr<Entry<T, M>>,
     free_list: AtomicPtr<FreeList>,
@@ -219,6 +219,12 @@ impl<T, M: Metadata> Entry<T, M> {
         let val = unsafe { &mut *slf.value.get() }.as_mut_ptr();
         unsafe {
             ptr::drop_in_place(val);
+        }
+        if let Some(tid_manager) = slf.tid_manager.as_ref() {
+            // FIXME: check if this entry is an alternative entry and free it if so.
+            // FIXME: but only do this if auto-freeing entries is okay.
+            tid_manager.lock().unwrap().free(); // FIXME: how do we know this id?
+
         }
         // signal that there is no thread associated with the entry anymore.
         // this also disables the cleanup of this entry in the `normal` entry
@@ -373,6 +379,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
     /// access the thread local it will never reallocate. The capacity may be rounded up to the
     /// nearest power of two.
     pub fn with_capacity(capacity: usize) -> ThreadLocal<T, M> {
+        let tid_manager = Box::new(Mutex::new(ThreadIdManager::new()));
         let allocated_buckets = capacity
             .checked_sub(1)
             .map(|c| usize::from(POINTER_WIDTH) - (c.leading_zeros() as usize) + 1)
@@ -381,7 +388,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
         let mut buckets = [null_mut(); BUCKETS];
         let mut bucket_size = 1;
         for (i, bucket) in buckets[..allocated_buckets].iter_mut().enumerate() {
-            *bucket = allocate_bucket::<T, M>(bucket_size);
+            *bucket = allocate_bucket::<false, T, M>(bucket_size, tid_manager.as_ref() as *const _);
 
             if i != 0 {
                 bucket_size <<= 1;
@@ -394,7 +401,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             .iter_mut()
             .enumerate()
         {
-            *bucket = allocate_bucket::<T, M>(bucket_size);
+            *bucket = allocate_bucket::<true, T, M>(bucket_size, tid_manager.as_ref() as *const _);
 
             if i != 0 {
                 bucket_size <<= 1;
@@ -406,7 +413,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
             // representation as a sequence of their inner type.
             buckets: unsafe { transmute(buckets) },
             alternative_buckets: unsafe { transmute(alternative_buckets) },
-            alternative_entry_ids: Mutex::new(ThreadIdManager::new()),
+            alternative_entry_ids: tid_manager,
         }
     }
 
@@ -544,7 +551,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket(thread.bucket_size());
+            let new_bucket = allocate_bucket::<false, T, M>(thread.bucket_size(), self.alternative_entry_ids.as_ref() as *const _);
 
             match bucket_atomic_ptr.compare_exchange(
                 null_mut(),
@@ -608,7 +615,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket(thread.bucket_size());
+            let new_bucket = allocate_bucket::<false, T, M>(thread.bucket_size(), self.alternative_entry_ids.as_ref() as *const _);
 
             match bucket_atomic_ptr.compare_exchange(
                 null_mut(),
@@ -653,7 +660,7 @@ impl<T: Send, M: Metadata> ThreadLocal<T, M> {
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket(bucket_size);
+            let new_bucket = allocate_bucket::<true, T, M>(bucket_size, self.alternative_entry_ids.as_ref() as *const _);
 
             match bucket_atomic_ptr.compare_exchange(
                 null_mut(),
@@ -1146,10 +1153,15 @@ impl<'a, T: Send + fmt::Debug, M: Metadata> fmt::Debug for IterMutMeta<'a, T, M>
     }
 }
 
-fn allocate_bucket<T, M: Metadata>(size: usize) -> *mut Entry<T, M> {
+fn allocate_bucket<const ALTERNATIVE: bool, T, M: Metadata>(size: usize, tid_manager: *const Mutex<ThreadIdManager>) -> *mut Entry<T, M> {
     Box::into_raw(
         (0..size)
             .map(|_| Entry::<T, M> {
+                tid_manager: if ALTERNATIVE {
+                    tid_manager
+                } else {
+                    null()
+                },
                 guard: AtomicUsize::new(GUARD_UNINIT),
                 alternative_entry: AtomicPtr::new(null_mut()),
                 free_list: Default::default(),

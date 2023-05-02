@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use crate::{Entry, INVALID_THREAD_ID, POINTER_WIDTH};
+use crate::{Entry, POINTER_WIDTH};
 use once_cell::sync::Lazy;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::cmp::Reverse;

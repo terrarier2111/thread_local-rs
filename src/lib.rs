@@ -182,7 +182,6 @@ impl<T, M: Metadata> Entry<T, M> {
         let mut backoff = Backoff::new();
         loop {
             match unsafe { &*free_list }.free_list.try_lock() {
-                // FIXME: this can deref an already dealloced piece of memory.
                 Ok(mut guard) => {
                     // we got the lock and can now remove our entry from the free list
                     guard.remove(&(self as *const Entry<T, M> as usize));

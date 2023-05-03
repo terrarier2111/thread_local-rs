@@ -107,7 +107,7 @@ const BUCKETS: usize = (POINTER_WIDTH + 1) as usize;
 /// Thread-local variable wrapper
 ///
 /// See the [module-level documentation](index.html) for more.
-pub struct ThreadLocal<T: Send, M: Metadata = ()> {
+pub struct ThreadLocal<T: Send, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
     /// The buckets in the thread local. The nth bucket contains `2^(n-1)`
     /// elements. Each bucket is lazily allocated.
     buckets: [AtomicPtr<Entry<T, M>>; BUCKETS],
@@ -126,24 +126,53 @@ const GUARD_ACTIVE_INTERNAL: usize = 3;
 const GUARD_ACTIVE_EXTERNAL: usize = 4;
 const GUARD_FREE_MANUALLY: usize = 5;
 
+#[derive(Copy, Clone)]
+pub struct EntryToken<T, M: Metadata, const AUTO_FREE_IDS: bool>(NonNull<Entry<T, M, AUTO_FREE_IDS>>);
+
+impl<T, M: Metadata, const AUTO_FREE_IDS: bool> EntryToken<T, M, AUTO_FREE_IDS> {
+
+    #[inline]
+    pub fn value(&self) -> &T {
+        unsafe { (&*self.0.as_ref().value.get()).assume_init_ref() }
+    }
+
+    #[inline]
+    pub fn meta(&self) -> &M {
+        unsafe { &self.0.as_ref().meta }
+    }
+
+    // FIXME: is this decent api design?
+    /*pub fn set_destruct(&self) {
+
+    }*/
+
+    // FIXME: is this decent api design?
+    pub fn destruct(&self) {
+        unsafe { self.0.as_ref() }.free_id();
+    }
+
+}
+
+// FIXME: support disabling AUTO_FREE_IDS (for entries that aren't alternative entries)
+
 // FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
-struct Entry<T, M: Metadata = ()> {
+struct Entry<T, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
     /// this will be null if this entry isn't an alternative entry.
     tid_manager: *const Mutex<ThreadIdManager>,
     id: usize,
     guard: AtomicUsize,
-    alternative_entry: AtomicPtr<Entry<T, M>>,
+    alternative_entry: AtomicPtr<Entry<T, M, AUTO_FREE_IDS>>,
     free_list: AtomicPtr<FreeList>,
     meta: M,
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
-impl<T, M: Metadata> Entry<T, M> {
+impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
     /// This should only be called when the central `ThreadLocal`
     /// struct gets dropped.
     pub(crate) unsafe fn try_detach_thread<const N: usize>(
         &self,
-        cleanup: &mut SmallVec<[*const Entry<T, M>; N]>,
+        cleanup: &mut SmallVec<[*const Entry<T, M, AUTO_FREE_IDS>; N]>,
     ) {
         let alt = self.alternative_entry.load(Ordering::Acquire);
 
@@ -201,7 +230,7 @@ impl<T, M: Metadata> Entry<T, M> {
     }
 
     pub(crate) unsafe fn cleanup(slf: *const Entry<()>) {
-        let slf = unsafe { &*slf.cast::<Entry<T, M>>() };
+        let slf = unsafe { &*slf.cast::<Entry<T, M, AUTO_FREE_IDS>>() };
         let mut backoff = Backoff::new();
         while slf
             .guard
@@ -223,9 +252,8 @@ impl<T, M: Metadata> Entry<T, M> {
 
         // check if this entry is an alternative entry and free it if so
 
-        // FIXME: only do this if auto-freeing entries is okay
-        if let Some(tid_manager) = slf.tid_manager.as_ref() {
-            tid_manager.lock().unwrap().free(slf.id);
+        if AUTO_FREE_IDS {
+            slf.free_id();
         }
         // signal that there is no thread associated with the entry anymore.
         // this also disables the cleanup of this entry in the `normal` entry
@@ -233,9 +261,16 @@ impl<T, M: Metadata> Entry<T, M> {
         slf.free_list.store(null_mut(), Ordering::Release);
         slf.guard.store(GUARD_EMPTY, Ordering::Release); // FIXME: is it okay to store GUARD_EMPTY even if there is still an alternative_entry present?
     }
+
+    fn free_id(&self) {
+        if let Some(tid_manager) = unsafe { self.tid_manager.as_ref() } {
+            tid_manager.lock().unwrap().free(self.id);
+        }
+    }
+
 }
 
-impl<T, M: Metadata> Drop for Entry<T, M> {
+impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Drop for Entry<T, M, AUTO_FREE_IDS> {
     fn drop(&mut self) {
         let guard = *self.guard.get_mut();
         if guard == GUARD_READY || guard == GUARD_ACTIVE_INTERNAL {
@@ -254,15 +289,15 @@ impl<T, M: Metadata> Drop for Entry<T, M> {
 }*/
 
 // ThreadLocal is always Sync, even if T isn't
-unsafe impl<T: Send, M: Metadata> Sync for ThreadLocal<T, M> {}
+unsafe impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Sync for ThreadLocal<T, M, AUTO_FREE_IDS> {}
 
-impl<T: Send, M: Metadata> Default for ThreadLocal<T, M> {
-    fn default() -> ThreadLocal<T, M> {
+impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Default for ThreadLocal<T, M, AUTO_FREE_IDS> {
+    fn default() -> ThreadLocal<T, M, AUTO_FREE_IDS> {
         ThreadLocal::new()
     }
 }
 
-impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
+impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Drop for ThreadLocal<T, M, AUTO_FREE_IDS> {
     fn drop(&mut self) {
         let mut bucket_size = 1;
 
@@ -370,16 +405,16 @@ impl<T: Send, M: Metadata> Drop for ThreadLocal<T, M> {
     }
 }
 
-impl<T: Send, M: Metadata> ThreadLocal<T, M> {
+impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FREE_IDS> {
     /// Creates a new empty `ThreadLocal`.
-    pub fn new() -> ThreadLocal<T, M> {
+    pub fn new() -> ThreadLocal<T, M, AUTO_FREE_IDS> {
         Self::with_capacity(2)
     }
 
     /// Creates a new `ThreadLocal` with an initial capacity. If less than the capacity threads
     /// access the thread local it will never reallocate. The capacity may be rounded up to the
     /// nearest power of two.
-    pub fn with_capacity(capacity: usize) -> ThreadLocal<T, M> {
+    pub fn with_capacity(capacity: usize) -> ThreadLocal<T, M, AUTO_FREE_IDS> {
         let tid_manager = Box::new(Mutex::new(ThreadIdManager::new()));
         let allocated_buckets = capacity
             .checked_sub(1)
@@ -1163,7 +1198,7 @@ fn allocate_bucket<const ALTERNATIVE: bool, T, M: Metadata>(size: usize, tid_man
                 } else {
                     null()
                 },
-                id: if ALTERNATIVE { n ^ (1 << bucket.saturating_sub(1)) } else { 0 }, // FIXME: do we need this sub?
+                id: if ALTERNATIVE { n ^ (1 << bucket.saturating_sub(1)) } else { usize::MAX }, // FIXME: do we need this sub?
                 guard: AtomicUsize::new(GUARD_UNINIT),
                 alternative_entry: AtomicPtr::new(null_mut()),
                 free_list: Default::default(),

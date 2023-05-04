@@ -112,12 +112,7 @@ impl FreeList {
     fn cleanup(&self) {
         self.dropping.store(true, Ordering::Release);
         let mut free_list = self.free_list.lock();
-        // FIXME: is there potential for a data race here if after calling cleanup on an entry, the free_id method gets called on it and
-        // FIXME: it tries to decrement the zero outstanding_shared count?
-        // FIXME: if so, this can be fixed by first storing usize::MAX instead of 0 into outstanding_shared and then
-        // FIXME: swapping outstanding_shared instead of simply storing a value into it and then subtracting the difference from
-        // FIXME: the swapped value to usize::MAX from the new outstanding_shared counter
-        let outstanding_shared = Box::new(AtomicUsize::new(0));
+        let outstanding_shared = Box::new(AtomicUsize::new(usize::MAX));
         let mut outstanding = 0;
         for entry in free_list.unwrap().iter() {
             // sum up all the "failed" cleanups
@@ -126,7 +121,13 @@ impl FreeList {
             }
         }
 
-        outstanding_shared.store(outstanding, Ordering::Release);
+        let prev = outstanding_shared.swap(outstanding, Ordering::Release);
+        let diff = usize::MAX - prev;
+        if diff > 0 {
+            if outstanding_shared.fetch_sub(diff, Ordering::AcqRel) == diff {
+                // FIXME: perform the actual cleanup
+            }
+        }
 
         mem::forget(outstanding);
     }

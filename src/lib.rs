@@ -163,7 +163,7 @@ struct Entry<T, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
     guard: AtomicUsize,
     alternative_entry: AtomicPtr<Entry<T, M, AUTO_FREE_IDS>>,
     free_list: AtomicPtr<FreeList>,
-    outstanding_refs: AtomicPtr<Box<AtomicUsize>>,
+    outstanding_refs: AtomicPtr<AtomicUsize>,
     meta: M,
     value: UnsafeCell<MaybeUninit<T>>,
 }
@@ -230,7 +230,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
         }
     }
 
-    pub(crate) unsafe fn cleanup(slf: *const Entry<()>) -> bool {
+    pub(crate) unsafe fn cleanup(slf: *const Entry<()>, remaining_cnt: *const AtomicUsize) -> bool {
         let slf = unsafe { &*slf.cast::<Entry<T, M, AUTO_FREE_IDS>>() };
         let mut backoff = Backoff::new();
         while slf
@@ -256,6 +256,11 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
         /*if AUTO_FREE_IDS { // FIXME: do we have to do smth else?
             slf.free_id();
         }*/
+
+        if !AUTO_FREE_IDS {
+            slf.outstanding_refs.store(remaining_cnt.cast_mut(), Ordering::Release);
+        }
+
         // signal that there is no thread associated with the entry anymore.
         // this also disables the cleanup of this entry in the `normal` entry
         // on destruction of the central struct.
@@ -265,6 +270,12 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
     }
 
     fn free_id(&self) {
+        if let Some(outstanding) = unsafe { self.outstanding_refs.load(Ordering::Acquire).as_ref() } {
+            if outstanding.fetch_sub(1, Ordering::AcqRel) != 1 {
+                // the ref count isn't low enough yet
+                return;
+            }
+        }
         if let Some(tid_manager) = unsafe { self.tid_manager.as_ref() } {
             tid_manager.lock().unwrap().free(self.id);
         }

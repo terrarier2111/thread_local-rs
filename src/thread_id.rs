@@ -112,32 +112,35 @@ impl FreeList {
     fn cleanup(&self) {
         self.dropping.store(true, Ordering::Release);
         let mut free_list = self.free_list.lock();
+        // FIXME: is there potential for a data race here if after calling cleanup on an entry, the free_id method gets called on it and
+        // FIXME: it tries to decrement the zero outstanding_shared count?
+        // FIXME: if so, this can be fixed by first storing usize::MAX instead of 0 into outstanding_shared and then
+        // FIXME: swapping outstanding_shared instead of simply storing a value into it and then subtracting the difference from
+        // FIXME: the swapped value to usize::MAX from the new outstanding_shared counter
+        let outstanding_shared = Box::new(AtomicUsize::new(0));
         let mut outstanding = 0;
         for entry in free_list.unwrap().iter() {
             // sum up all the "failed" cleanups
-            if unsafe { !entry.1.cleanup(*entry.0 as *const Entry<()>) } {
+            if unsafe { !entry.1.cleanup(*entry.0 as *const Entry<()>, &outstanding_shared as *const Box<AtomicUsize> as *const AtomicUsize) } {
                 outstanding += 1;
             }
         }
-        let outstanding = Box::new(AtomicUsize::new(outstanding));
 
-        for entry in free_list.unwrap().iter() {
-            (*entry.0 as *const Entry<()>).outstanding_refs.store((&outstanding as *const Box<AtomicUsize>).cast_mut(), Ordering::Release);
-        }
+        outstanding_shared.store(outstanding, Ordering::Release);
 
         mem::forget(outstanding);
     }
 }
 
 pub(crate) struct EntryData {
-    pub(crate) drop_fn: unsafe fn(*const Entry<()>) -> bool,
+    pub(crate) drop_fn: unsafe fn(*const Entry<()>, *const AtomicUsize) -> bool,
 }
 
 impl EntryData {
     #[inline]
-    unsafe fn cleanup(&self, data: *const Entry<()>) -> bool {
+    unsafe fn cleanup(&self, data: *const Entry<()>, outstanding: *const AtomicUsize) -> bool {
         let dfn = self.drop_fn;
-        unsafe { dfn(data) }
+        dfn(data, outstanding)
     }
 }
 

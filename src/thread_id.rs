@@ -13,7 +13,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::process::abort;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::usize;
+use std::{mem, usize};
 
 /// Thread ID manager which allocates thread IDs. It attempts to aggressively
 /// reuse thread IDs where possible to avoid cases where a ThreadLocal grows
@@ -112,23 +112,32 @@ impl FreeList {
     fn cleanup(&self) {
         self.dropping.store(true, Ordering::Release);
         let mut free_list = self.free_list.lock();
+        let mut outstanding = 0;
         for entry in free_list.unwrap().iter() {
-            unsafe {
-                entry.1.cleanup(*entry.0 as *const Entry<()>);
+            // sum up all the "failed" cleanups
+            if unsafe { !entry.1.cleanup(*entry.0 as *const Entry<()>) } {
+                outstanding += 1;
             }
         }
+        let outstanding = Box::new(AtomicUsize::new(outstanding));
+
+        for entry in free_list.unwrap().iter() {
+            (*entry.0 as *const Entry<()>).outstanding_refs.store((&outstanding as *const Box<AtomicUsize>).cast_mut(), Ordering::Release);
+        }
+
+        mem::forget(outstanding);
     }
 }
 
 pub(crate) struct EntryData {
-    pub(crate) drop_fn: unsafe fn(*const Entry<()>),
+    pub(crate) drop_fn: unsafe fn(*const Entry<()>) -> bool,
 }
 
 impl EntryData {
     #[inline]
-    unsafe fn cleanup(&self, data: *const Entry<()>) {
+    unsafe fn cleanup(&self, data: *const Entry<()>) -> bool {
         let dfn = self.drop_fn;
-        unsafe { dfn(data) };
+        unsafe { dfn(data) }
     }
 }
 

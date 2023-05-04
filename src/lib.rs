@@ -163,6 +163,7 @@ struct Entry<T, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
     guard: AtomicUsize,
     alternative_entry: AtomicPtr<Entry<T, M, AUTO_FREE_IDS>>,
     free_list: AtomicPtr<FreeList>,
+    outstanding_refs: AtomicPtr<Box<AtomicUsize>>,
     meta: M,
     value: UnsafeCell<MaybeUninit<T>>,
 }
@@ -229,7 +230,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
         }
     }
 
-    pub(crate) unsafe fn cleanup(slf: *const Entry<()>) {
+    pub(crate) unsafe fn cleanup(slf: *const Entry<()>) -> bool {
         let slf = unsafe { &*slf.cast::<Entry<T, M, AUTO_FREE_IDS>>() };
         let mut backoff = Backoff::new();
         while slf
@@ -252,14 +253,15 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
 
         // check if this entry is an alternative entry and free it if so
 
-        if AUTO_FREE_IDS {
+        /*if AUTO_FREE_IDS { // FIXME: do we have to do smth else?
             slf.free_id();
-        }
+        }*/
         // signal that there is no thread associated with the entry anymore.
         // this also disables the cleanup of this entry in the `normal` entry
         // on destruction of the central struct.
         slf.free_list.store(null_mut(), Ordering::Release);
         slf.guard.store(GUARD_EMPTY, Ordering::Release); // FIXME: is it okay to store GUARD_EMPTY even if there is still an alternative_entry present?
+        AUTO_FREE_IDS
     }
 
     fn free_id(&self) {

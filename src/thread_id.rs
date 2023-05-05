@@ -13,7 +13,8 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::process::abort;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::{mem, usize};
+use std::mem;
+use std::ops::Deref;
 
 /// Thread ID manager which allocates thread IDs. It attempts to aggressively
 /// reuse thread IDs where possible to avoid cases where a ThreadLocal grows
@@ -96,6 +97,16 @@ pub(crate) fn id_into_parts(id: usize) -> (usize, usize, usize) {
     (bucket, bucket_size, index)
 }
 
+#[inline]
+pub(crate) fn global_tid_manager() -> *const Mutex<ThreadIdManager> {
+    THREAD_ID_MANAGER.deref() as *const _
+}
+
+#[inline]
+pub(crate) unsafe fn cleanup_id(id: usize) {
+    THREAD_ID_MANAGER.lock().unwrap().free(id);
+}
+
 pub(crate) struct FreeList {
     pub(crate) dropping: AtomicBool,
     pub(crate) free_list: Mutex<HashMap<usize, EntryData>>,
@@ -125,7 +136,9 @@ impl FreeList {
         let diff = usize::MAX - prev;
         if diff > 0 {
             if outstanding_shared.fetch_sub(diff, Ordering::AcqRel) == diff {
-                // FIXME: perform the actual cleanup
+                // perform the actual cleanup of the id
+                let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
+                THREAD_ID_MANAGER.lock().unwrap().free(id);
             }
         }
 

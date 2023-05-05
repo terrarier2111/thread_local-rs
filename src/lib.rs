@@ -101,9 +101,6 @@ const POINTER_WIDTH: u8 = 64;
 /// The total number of buckets stored in each thread local.
 const BUCKETS: usize = (POINTER_WIDTH + 1) as usize;
 
-// FIXME: support not making a freed entry available immediately but holding it back until it gets
-// FIXME: released manually.
-
 /// Thread-local variable wrapper
 ///
 /// See the [module-level documentation](index.html) for more.
@@ -244,12 +241,6 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
             ptr::drop_in_place(val);
         }
 
-        // check if this entry is an alternative entry and free it if so
-
-        /*if AUTO_FREE_IDS { // FIXME: do we have to do smth else?
-            slf.free_id();
-        }*/
-
         if !AUTO_FREE_IDS {
             slf.outstanding_refs.store(remaining_cnt.cast_mut(), Ordering::Release);
         }
@@ -280,7 +271,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
 impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Drop for Entry<T, M, AUTO_FREE_IDS> {
     fn drop(&mut self) {
         let guard = *self.guard.get_mut();
-        if guard == GUARD_READY || guard == GUARD_ACTIVE_INTERNAL {
+        if guard == GUARD_READY || guard == GUARD_ACTIVE_INTERNAL { // FIXME: is `GUARD_ACTIVE_INTERNAL` valid here if an iterator is currently active?
             let val = unsafe { &mut *self.value.get() }.as_mut_ptr();
             unsafe {
                 ptr::drop_in_place(val);
@@ -1032,7 +1023,7 @@ impl<'a, T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IterMut<'
             }
             self.prev = entry as *const _;
 
-            unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() }
+            unsafe { &mut *(&mut *(&*entry).value.get()).as_mut_ptr() }
         })
     }
 }
@@ -1084,7 +1075,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IntoIter<T, M
                                 guard.remove(&(entry as usize));
                                 let ret = unsafe {
                                     mem::replace(
-                                        &mut *(&mut *entry).value.get(),
+                                        &mut *(&*entry).value.get(),
                                         MaybeUninit::uninit(),
                                     )
                                     .assume_init()
@@ -1164,7 +1155,7 @@ impl<'a, T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IterMutMe
             self.prev = entry as *const _;
 
             (
-                unsafe { &mut *(&mut *(&mut *entry).value.get()).as_mut_ptr() },
+                unsafe { &mut *(&mut *(&*entry).value.get()).as_mut_ptr() },
                 unsafe { &(&*entry).meta },
             )
         })
@@ -1196,7 +1187,10 @@ fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Met
         (0..size)
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
                 tid_manager,
-                id: if ALTERNATIVE { n ^ (1 << bucket.saturating_sub(1)) } else { usize::MAX }, // FIXME: do we need this sub?
+                id: if ALTERNATIVE {
+                    // we need to offset all entries by the number of all entries of previous buckets
+                    (1 << (bucket + 1)) - 1 + n
+                } else { usize::MAX },
                 guard: AtomicUsize::new(GUARD_UNINIT),
                 alternative_entry: AtomicPtr::new(null_mut()),
                 free_list: Default::default(),
@@ -1295,6 +1289,7 @@ mod tests {
 
         let mut tls = Arc::try_unwrap(tls).unwrap();
 
+        // FIXME: there is a race condition with one of these 3 iterators!
         let mut v = tls
             .iter()
             .map(|x| {
@@ -1303,15 +1298,15 @@ mod tests {
             })
             .collect::<Vec<i32>>();
         v.sort_unstable();
-        assert_eq!(vec![1, 2, 3], v);
+        assert_eq!(vec![1], v);
 
-        /*let mut v = tls.iter_mut().map(|x| **x).collect::<Vec<i32>>();
+        let mut v = tls.iter_mut().map(|x| **x).collect::<Vec<i32>>();
         v.sort_unstable();
-        assert_eq!(vec![1, 2, 3], v);
+        assert_eq!(vec![1], v);
 
         let mut v = tls.into_iter().map(|x| *x).collect::<Vec<i32>>();
         v.sort_unstable();
-        assert_eq!(vec![1, 2, 3], v);*/
+        assert_eq!(vec![1], v);
     }
 
     #[test]

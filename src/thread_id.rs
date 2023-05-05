@@ -169,7 +169,7 @@ static mut FREE_LIST: Option<FreeList> = None;
 thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard }; }
 
 // Guard to ensure the thread ID is released on thread exit.
-struct ThreadGuard; // FIXME: maybe add a field `discharged` to indicate whether the thread id should be freed or kept in-use
+struct ThreadGuard;
 
 impl Drop for ThreadGuard {
     fn drop(&mut self) {

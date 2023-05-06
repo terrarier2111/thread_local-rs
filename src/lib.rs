@@ -121,7 +121,8 @@ const GUARD_READY: usize = 2;
 // the guard is currently active and anybody wanting to use it has to wait
 const GUARD_ACTIVE_INTERNAL: usize = 3;
 const GUARD_ACTIVE_EXTERNAL: usize = 4;
-const GUARD_FREE_MANUALLY: usize = 5;
+const GUARD_ACTIVE_ITERATOR: usize = 5;
+const GUARD_FREE_MANUALLY: usize = 6;
 
 #[derive(Copy, Clone)]
 pub struct EntryToken<T, M: Metadata, const AUTO_FREE_IDS: bool>(NonNull<Entry<T, M, AUTO_FREE_IDS>>);
@@ -271,7 +272,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
 impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Drop for Entry<T, M, AUTO_FREE_IDS> {
     fn drop(&mut self) {
         let guard = *self.guard.get_mut();
-        if guard == GUARD_READY || guard == GUARD_ACTIVE_INTERNAL { // FIXME: is `GUARD_ACTIVE_INTERNAL` valid here if an iterator is currently active?
+        if guard == GUARD_READY || guard == GUARD_ACTIVE_INTERNAL {
             let val = unsafe { &mut *self.value.get() }.as_mut_ptr();
             unsafe {
                 ptr::drop_in_place(val);
@@ -904,18 +905,28 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
             while self.index < self.bucket_size {
                 let entry = unsafe { &*bucket.add(self.index) };
                 self.index += 1;
-                match entry.guard.compare_exchange(
-                    GUARD_READY,
-                    NEW_GUARD,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        return Some(entry);
-                    }
-                    Err(guard) => {
-                        if guard == GUARD_UNINIT {
-                            return None;
+                let mut backoff = Backoff::new();
+                // this loop will only ever loop multiple times if the guard of the current entry
+                // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
+                // we have to wait on another iterator to use it.
+                loop {
+                    match entry.guard.compare_exchange(
+                        GUARD_READY,
+                        NEW_GUARD,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            return Some(entry);
+                        }
+                        Err(guard) => {
+                            if guard == GUARD_UNINIT {
+                                return None;
+                            }
+                            if guard != GUARD_ACTIVE_ITERATOR {
+                                break;
+                            }
+                            backoff.snooze();
                         }
                     }
                 }
@@ -977,7 +988,7 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
 #[derive(Debug)]
 pub struct Iter<'a, T: Send + Sync, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
     thread_local: &'a ThreadLocal<T, M, AUTO_FREE_IDS>,
-    raw: RawIter<GUARD_ACTIVE_INTERNAL>,
+    raw: RawIter<GUARD_ACTIVE_ITERATOR>,
     prev: *const Entry<T, M, AUTO_FREE_IDS>,
 }
 
@@ -1009,7 +1020,7 @@ impl<T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> Drop for Iter<'_, T
 /// Mutable iterator over the contents of a `ThreadLocal`.
 pub struct IterMut<'a, T: Send, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
     thread_local: &'a mut ThreadLocal<T, M, AUTO_FREE_IDS>,
-    raw: RawIter<GUARD_ACTIVE_INTERNAL>,
+    raw: RawIter<GUARD_ACTIVE_ITERATOR>,
     prev: *const Entry<T, M, AUTO_FREE_IDS>,
 }
 
@@ -1108,7 +1119,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> FusedIterator for IntoIter
 #[derive(Debug)]
 pub struct IterMeta<'a, T: Send + Sync, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
     thread_local: &'a ThreadLocal<T, M, AUTO_FREE_IDS>,
-    raw: RawIter<GUARD_ACTIVE_INTERNAL>,
+    raw: RawIter<GUARD_ACTIVE_ITERATOR>,
     prev: *const Entry<T, M, AUTO_FREE_IDS>,
 }
 
@@ -1140,7 +1151,7 @@ impl<T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> Drop for IterMeta<'
 /// Mutable iterator over the contents of a `ThreadLocal`.
 pub struct IterMutMeta<'a, T: Send, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
     thread_local: &'a mut ThreadLocal<T, M, AUTO_FREE_IDS>,
-    raw: RawIter<GUARD_ACTIVE_INTERNAL>,
+    raw: RawIter<GUARD_ACTIVE_ITERATOR>,
     prev: *const Entry<T, M, AUTO_FREE_IDS>,
 }
 
@@ -1148,8 +1159,36 @@ impl<'a, T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IterMutMe
     type Item = (&'a mut T, &'a M);
 
     fn next(&mut self) -> Option<(&'a mut T, &'a M)> {
+        /*if let Some(prev) = unsafe { self.prev.as_ref() } {
+            let alt = prev.alternative_entry.load(Ordering::Acquire);
+            if let Some(alt) = unsafe { alt.as_ref() } {
+                match alt.guard.compare_exchange(
+                    GUARD_READY,
+                    GUARD_ACTIVE_INTERNAL,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        return Some((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut());
+                    }
+                    Err(guard) => {
+                        if guard == GUARD_UNINIT {
+                            return None;
+                        }
+                    }
+                }
+
+                self.prev = alt as *const _;
+
+                (
+                    unsafe { &mut *(&mut *alt.value.get()).as_mut_ptr() },
+                    unsafe { &alt.meta },
+                )
+            }
+            prev.guard.store(GUARD_READY, Ordering::Release);
+        }*/
         self.raw.next_mut(self.thread_local).map(move |entry| {
-            if let Some(prev) = unsafe { self.prev.as_ref() } {
+            if let Some(prev) = unsafe { self.prev.as_ref() } { // FIXME: get rid of this once the thing above works!
                 prev.guard.store(GUARD_READY, Ordering::Release);
             }
             self.prev = entry as *const _;

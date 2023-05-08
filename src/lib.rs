@@ -31,9 +31,11 @@
 //! ```rust
 //! use thread_local::ThreadLocal;
 //! let tls: ThreadLocal<u32> = ThreadLocal::new();
-//! assert_eq!(tls.get(), None);
-//! assert_eq!(tls.get_or(|| 5), &5);
-//! assert_eq!(tls.get(), Some(&5));
+//! let entry = tls.get();
+//! assert_eq!(entry.as_ref().map(|entry| entry.value()), None);
+//! assert_eq!(tls.get_or(|_| 5, |_| {}).value(), &5);
+//! let entry = tls.get();
+//! assert_eq!(entry.as_ref().map(|entry| entry.value()), Some(&5));
 //! ```
 //!
 //! Combining thread-local values into a single result:
@@ -51,8 +53,8 @@
 //!     let tls2 = tls.clone();
 //!     thread::spawn(move || {
 //!         // Increment a counter to count some event...
-//!         let cell = tls2.get_or(|| Cell::new(0));
-//!         cell.set(cell.get() + 1);
+//!         let cell = tls2.get_or(|_| Cell::new(0), |_| {});
+//!         cell.value().set(cell.value().get() + 1);
 //!     }).join().unwrap();
 //! }
 //!
@@ -68,12 +70,8 @@
 #![allow(clippy::mutex_atomic)]
 #![feature(thread_local)]
 
-mod cached;
 mod thread_id;
 mod unreachable;
-
-#[allow(deprecated)]
-pub use cached::{CachedIntoIter, CachedIterMut, CachedThreadLocal};
 
 use crate::thread_id::{EntryData, FreeList, global_tid_manager, Thread, ThreadIdManager};
 use crossbeam_utils::Backoff;
@@ -81,6 +79,7 @@ use smallvec::{smallvec, SmallVec};
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::iter::FusedIterator;
+use std::marker::PhantomData;
 use std::mem;
 use std::mem::{size_of, transmute, MaybeUninit};
 use std::panic::UnwindSafe;
@@ -124,10 +123,10 @@ const GUARD_ACTIVE_EXTERNAL: usize = 4;
 const GUARD_ACTIVE_ITERATOR: usize = 5;
 const GUARD_FREE_MANUALLY: usize = 6;
 
-#[derive(Copy, Clone)]
-pub struct EntryToken<T, M: Metadata, const AUTO_FREE_IDS: bool>(NonNull<Entry<T, M, AUTO_FREE_IDS>>);
+#[derive(PartialEq)]
+pub struct EntryToken<'a, ACCESS, T, M: Metadata, const AUTO_FREE_IDS: bool>(NonNull<Entry<T, M, AUTO_FREE_IDS>>, PhantomData<&'a ACCESS>);
 
-impl<T, M: Metadata, const AUTO_FREE_IDS: bool> EntryToken<T, M, AUTO_FREE_IDS> {
+impl<'a, ACCESS, T, M: Metadata, const AUTO_FREE_IDS: bool> EntryToken<'a, ACCESS, T, M, AUTO_FREE_IDS> {
 
     #[inline]
     pub fn value(&self) -> &T {
@@ -140,15 +139,27 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> EntryToken<T, M, AUTO_FREE_IDS> 
     }
 
     /// SAFETY: This may only be called after the thread associated with this thread local has finished.
-    pub fn destruct(&self) {
+    pub unsafe fn destruct(self) {
         unsafe { self.0.as_ref().free_id(); }
     }
 
 }
 
+impl<'a, T, M: Metadata, const AUTO_FREE_IDS: bool> EntryToken<'a, MutRefAccess, T, M, AUTO_FREE_IDS> {
+
+    #[inline]
+    pub fn value_mut(&mut self) -> &mut T {
+        unsafe { (&mut *self.0.as_ref().value.get()).assume_init_mut() }
+    }
+
+}
+
+pub struct MutRefAccess;
+
+pub struct RefAccess;
+
 // FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
 struct Entry<T, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
-    /// this will be null if this entry isn't an alternative entry.
     tid_manager: *const Mutex<ThreadIdManager>,
     id: usize,
     guard: AtomicUsize,
@@ -223,7 +234,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
 
     pub(crate) unsafe fn cleanup(slf: *const Entry<()>, remaining_cnt: *const AtomicUsize) -> bool {
         let slf = unsafe { &*slf.cast::<Entry<T, M, AUTO_FREE_IDS>>() };
-        let mut backoff = Backoff::new();
+        let backoff = Backoff::new();
         while slf
             .guard
             .compare_exchange_weak(
@@ -349,7 +360,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Drop for ThreadLocal<T, M,
             // FIXME: all of them while awaiting the "normal" buckets.
             for offset in 0..this_bucket_size {
                 let entry = unsafe { bucket_ptr.add(offset).as_ref().unwrap_unchecked() };
-                let mut backoff = Backoff::new();
+                let backoff = Backoff::new();
                 while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE_EXTERNAL {
                     backoff.snooze();
                 }
@@ -448,124 +459,42 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
     }
 
     /// Returns the element for the current thread, if it exists.
-    pub fn get(&self) -> Option<&T> {
+    pub fn get(&self) -> Option<EntryToken<RefAccess, T, M, AUTO_FREE_IDS>> {
         self.get_inner(thread_id::get())
-    }
-
-    /// Returns the meta of the element for the current thread, if it exists.
-    pub fn get_meta(&self) -> Option<&M> {
-        self.get_inner_meta(thread_id::get())
-    }
-
-    /// Returns the meta and value of the element for the current thread, if it exists.
-    pub fn get_val_and_meta(&self) -> Option<(&T, &M)> {
-        self.get_inner_val_and_meta(thread_id::get())
     }
 
     /// Returns the element for the current thread, or creates it if it doesn't
     /// exist.
-    pub fn get_or<F>(&self, create: F) -> &T
-    where
-        F: FnOnce() -> T,
-    {
-        unsafe {
-            self.get_or_try(|| Ok::<T, ()>(create()))
-                .unchecked_unwrap_ok()
-        }
-    }
-
-    /// Returns the meta and value of the element for the current thread, or creates it if it doesn't
-    /// exist.
-    pub fn get_val_and_meta_or<F, MF>(&self, create: F, meta: MF) -> (&T, &M)
+    pub fn get_or<F, MF>(&self, create: F, meta: MF) -> EntryToken<'_, RefAccess, T, M, AUTO_FREE_IDS>
     where
         F: FnOnce(*const M) -> T,
         MF: FnOnce(&M),
     {
         let thread = thread_id::get();
-        if let Some(val) = self.get_inner_val_and_meta(thread) {
+        if let Some(val) = self.get_inner(thread) {
             return val;
         }
 
-        self.insert_with_meta(create, meta)
+        self.insert(create, meta)
     }
 
-    /// Returns the element for the current thread, or creates it if it doesn't
-    /// exist. If `create` fails, that error is returned and no element is
-    /// added.
-    pub fn get_or_try<F, E>(&self, create: F) -> Result<&T, E>
-    where
-        F: FnOnce() -> Result<T, E>,
-    {
-        let thread = thread_id::get();
-        if let Some(val) = self.get_inner(thread) {
-            return Ok(val);
-        }
-
-        Ok(self.insert(create()?))
-    }
-
-    fn get_inner(&self, thread: Thread) -> Option<&T> {
+    fn get_inner(&self, thread: Thread) -> Option<EntryToken<'_, RefAccess, T, M, AUTO_FREE_IDS>> {
         let bucket_ptr =
             unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
         if bucket_ptr.is_null() {
             return None;
         }
-        let entry = unsafe { &*bucket_ptr.add(thread.index) };
+        let entry_ptr = unsafe { bucket_ptr.add(thread.index) };
+        let entry = unsafe { &*entry_ptr };
         let free_list = entry.free_list.load(Ordering::Acquire);
         // check if the entry is usable (it has an init value and it's not a pseudo-present value)
         if free_list.cast_const() == thread.free_list {
-            Some(unsafe { &*(&*entry.value.get()).as_ptr() })
+            Some(EntryToken(unsafe { NonNull::new_unchecked(entry_ptr) }, Default::default()))
         } else {
-            let alt = entry.alternative_entry.load(Ordering::Acquire);
+            let alt_ptr = entry.alternative_entry.load(Ordering::Acquire);
             // check if the entry has an alternative entry (and thus a pseudo-present value)
-            if let Some(alt) = unsafe { alt.as_ref() } {
-                Some(unsafe { &*(&*alt.value.get()).as_ptr() })
-            } else {
-                None
-            }
-        }
-    }
-
-    fn get_inner_meta(&self, thread: Thread) -> Option<&M> {
-        let bucket_ptr =
-            unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
-        if bucket_ptr.is_null() {
-            return None;
-        }
-
-        let entry = unsafe { &*bucket_ptr.add(thread.index) };
-        let free_list = entry.free_list.load(Ordering::Acquire);
-        // check if the entry is usable (it has an init value and it's not a pseudo-present value)
-        if free_list.cast_const() == thread.free_list {
-            Some(&entry.meta)
-        } else {
-            let alt = entry.alternative_entry.load(Ordering::Acquire);
-            // check if the entry has an alternative entry (and thus a pseudo-present value)
-            if let Some(alt) = unsafe { alt.as_ref() } {
-                Some(&alt.meta)
-            } else {
-                None
-            }
-        }
-    }
-
-    fn get_inner_val_and_meta(&self, thread: Thread) -> Option<(&T, &M)> {
-        let bucket_ptr =
-            unsafe { self.buckets.get_unchecked(thread.bucket) }.load(Ordering::Acquire);
-        if bucket_ptr.is_null() {
-            return None;
-        }
-
-        let entry = unsafe { &*bucket_ptr.add(thread.index) };
-        let free_list = entry.free_list.load(Ordering::Acquire);
-        // check if the entry is usable (it has an init value and it's not a pseudo-present value)
-        if free_list.cast_const() == thread.free_list {
-            Some((unsafe { &*(&*entry.value.get()).as_ptr() }, &entry.meta))
-        } else {
-            let alt = entry.alternative_entry.load(Ordering::Acquire);
-            // check if the entry has an alternative entry (and thus a pseudo-present value)
-            if let Some(alt) = unsafe { alt.as_ref() } {
-                Some((unsafe { &*(&*alt.value.get()).as_ptr() }, &alt.meta))
+            if !alt_ptr.is_null() {
+                Some(EntryToken(unsafe { NonNull::new_unchecked(alt_ptr) }, Default::default()))
             } else {
                 None
             }
@@ -574,7 +503,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
 
     // FIXME: support insertion in alternative entries!
     #[cold]
-    fn insert(&self, data: T) -> &T {
+    fn insert<F: FnOnce(*const M) -> T, FM: FnOnce(&M)>(&self, f: F, fm: FM) -> EntryToken<RefAccess, T, M, AUTO_FREE_IDS> {
         let thread = thread_id::get();
         let bucket_atomic_ptr = unsafe { self.buckets.get_unchecked(thread.bucket) };
         let bucket_ptr: *const _ = bucket_atomic_ptr.load(Ordering::Acquire);
@@ -603,7 +532,8 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         };
 
         // Insert the new element into the bucket
-        let mut entry = unsafe { &*bucket_ptr.add(thread.index) };
+        let entry_ptr = unsafe { bucket_ptr.add(thread.index) };
+        let mut entry = unsafe { &*entry_ptr };
 
         if entry.guard.load(Ordering::Acquire) == GUARD_FREE_MANUALLY {
             // FIXME: do we have to support traversing alternative entries recursively?
@@ -613,9 +543,9 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         }
 
         let value_ptr = entry.value.get();
-        unsafe { value_ptr.write(MaybeUninit::new(data)) };
+        unsafe { value_ptr.write(MaybeUninit::new(f(&entry.meta as *const M))) };
         if size_of::<M>() > 0 {
-            entry.meta.set_default();
+            fm(&entry.meta);
         }
         let cleanup_fn = Entry::<T, M, AUTO_FREE_IDS>::cleanup;
         unsafe { thread.free_list.as_ref().unwrap_unchecked() }
@@ -633,7 +563,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             .store(thread.free_list.cast_mut(), Ordering::Release);
         entry.guard.store(GUARD_READY, Ordering::Release);
 
-        unsafe { &*(&*value_ptr).as_ptr() }
+        EntryToken(unsafe { NonNull::new_unchecked(entry_ptr.cast_mut()) }, Default::default())
     }
 
     // FIXME: support insertion in alternative entries!
@@ -744,35 +674,6 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         }
     }
 
-    /// Returns an iterator over the local values and metadata of all threads in unspecified
-    /// order.
-    ///
-    /// This call can be done safely, as `T` is required to implement [`Sync`].
-    pub fn iter_meta(&self) -> IterMeta<'_, T, M, AUTO_FREE_IDS>
-    where
-        T: Sync,
-    {
-        IterMeta {
-            thread_local: self,
-            raw: RawIter::new(),
-            prev: null(),
-        }
-    }
-
-    /// Returns a mutable iterator over the local values and metadata of all threads in
-    /// unspecified order.
-    ///
-    /// Since this call borrows the `ThreadLocal` mutably, this operation can
-    /// be done safely---the mutable borrow statically guarantees no other
-    /// threads are currently accessing their associated values.
-    pub fn iter_mut_meta(&mut self) -> IterMutMeta<T, M, AUTO_FREE_IDS> {
-        IterMutMeta {
-            thread_local: self,
-            raw: RawIter::new(),
-            prev: null(),
-        }
-    }
-
     /// Removes all thread-specific values from the `ThreadLocal`, effectively
     /// resetting it to its original state.
     ///
@@ -839,7 +740,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> IntoIterator for ThreadLoc
 }
 
 impl<'a, T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> IntoIterator for &'a ThreadLocal<T, M, AUTO_FREE_IDS> {
-    type Item = &'a T;
+    type Item = EntryToken<'a, RefAccess, T, M, AUTO_FREE_IDS>;
     type IntoIter = Iter<'a, T, M, AUTO_FREE_IDS>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -848,7 +749,7 @@ impl<'a, T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> IntoIterator fo
 }
 
 impl<'a, T: Send, M: Metadata, const AUTO_FREE_IDS: bool> IntoIterator for &'a mut ThreadLocal<T, M, AUTO_FREE_IDS> {
-    type Item = &'a mut T;
+    type Item = EntryToken<'a, MutRefAccess, T, M, AUTO_FREE_IDS>;
     type IntoIter = IterMut<'a, T, M, AUTO_FREE_IDS>;
 
     fn into_iter(self) -> IterMut<'a, T, M, AUTO_FREE_IDS> {
@@ -856,17 +757,18 @@ impl<'a, T: Send, M: Metadata, const AUTO_FREE_IDS: bool> IntoIterator for &'a m
     }
 }
 
-impl<T: Send + Default, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FREE_IDS> {
+impl<T: Send + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T, (), AUTO_FREE_IDS> {
     /// Returns the element for the current thread, or creates a default one if
     /// it doesn't exist.
-    pub fn get_or_default(&self) -> &T {
-        self.get_or(Default::default)
+    pub fn get_or_default(&self) -> EntryToken<RefAccess, T, (), AUTO_FREE_IDS> {
+        self.get_or(|_| Default::default(), |_| ())
     }
 }
 
 impl<T: Send + fmt::Debug, M: Metadata, const AUTO_FREE_IDS: bool> fmt::Debug for ThreadLocal<T, M, AUTO_FREE_IDS> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "ThreadLocal {{ local_data: {:?} }}", self.get())
+        let entry = self.get();
+        write!(f, "ThreadLocal {{ local_data: {:?} }}", entry.as_ref().map(|entry| entry.value()))
     }
 }
 
@@ -993,14 +895,14 @@ pub struct Iter<'a, T: Send + Sync, M: Metadata = (), const AUTO_FREE_IDS: bool 
 }
 
 impl<'a, T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for Iter<'a, T, M, AUTO_FREE_IDS> {
-    type Item = &'a T;
+    type Item = EntryToken<'a, RefAccess, T, M, AUTO_FREE_IDS>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(prev) = unsafe { self.prev.as_ref() } {
             // mark the previous entry as `READY` again as we are done using it at this point.
             prev.guard.store(GUARD_READY, Ordering::Release);
-            let alt = prev.alternative_entry.load(Ordering::Acquire);
-            if let Some(alt) = unsafe { alt.as_ref() } {
+            let alt_ptr = prev.alternative_entry.load(Ordering::Acquire);
+            if let Some(alt) = unsafe { alt_ptr.as_ref() } {
                 let mut backoff = Backoff::new();
                 // this loop will only ever loop multiple times if the guard of the current entry
                 // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
@@ -1013,7 +915,7 @@ impl<'a, T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for It
                         Ordering::Relaxed,
                     ) {
                         Ok(_) => {
-                            return Some(unsafe { (&*alt.value.get()).assume_init_ref() });
+                            return Some(EntryToken(unsafe { NonNull::new_unchecked(alt_ptr) }, Default::default()));
                         }
                         Err(guard) => {
                             if guard == GUARD_UNINIT {
@@ -1029,14 +931,14 @@ impl<'a, T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for It
 
                 self.prev = alt as *const _;
 
-                return Some(unsafe { (&*alt.value.get()).assume_init_ref() });
+                return Some(EntryToken(unsafe { NonNull::new_unchecked(alt_ptr) }, Default::default()));
             }
         }
 
         self.raw.next(self.thread_local).map(|entry| {
             self.prev = entry as *const _;
 
-            unsafe { (&*entry.value.get()).assume_init_ref() }
+            EntryToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default())
         })
     }
 }
@@ -1059,14 +961,14 @@ pub struct IterMut<'a, T: Send, M: Metadata = (), const AUTO_FREE_IDS: bool = tr
 }
 
 impl<'a, T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IterMut<'a, T, M, AUTO_FREE_IDS> {
-    type Item = &'a mut T;
+    type Item = EntryToken<'a, MutRefAccess, T, M, AUTO_FREE_IDS>;
 
-    fn next(&mut self) -> Option<&'a mut T> {
+    fn next(&mut self) -> Option<Self::Item> {
         if let Some(prev) = unsafe { self.prev.as_ref() } {
             // mark the previous entry as `READY` again as we are done using it at this point.
             prev.guard.store(GUARD_READY, Ordering::Release);
-            let alt = prev.alternative_entry.load(Ordering::Acquire);
-            if let Some(alt) = unsafe { alt.as_ref() } {
+            let alt_ptr = prev.alternative_entry.load(Ordering::Acquire);
+            if let Some(alt) = unsafe { alt_ptr.as_ref() } {
                 let mut backoff = Backoff::new();
                 // this loop will only ever loop multiple times if the guard of the current entry
                 // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
@@ -1079,7 +981,7 @@ impl<'a, T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IterMut<'
                         Ordering::Relaxed,
                     ) {
                         Ok(_) => {
-                            return Some(unsafe { (&mut *alt.value.get()).assume_init_mut() });
+                            return Some(EntryToken(unsafe { NonNull::new_unchecked(alt_ptr) }, Default::default()));
                         }
                         Err(guard) => {
                             if guard == GUARD_UNINIT {
@@ -1095,14 +997,14 @@ impl<'a, T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IterMut<'
 
                 self.prev = alt as *const _;
 
-                return Some(unsafe { (&mut *alt.value.get()).assume_init_mut() });
+                return Some(EntryToken(unsafe { NonNull::new_unchecked(alt_ptr) }, Default::default()));
             }
         }
 
         self.raw.next_mut(self.thread_local).map(|entry| {
-            self.prev = entry as *const _;
+            self.prev = entry.cast_const();
 
-            unsafe { (&mut *(&*entry).value.get()).assume_init_mut() }
+            EntryToken(unsafe { NonNull::new_unchecked(entry) }, Default::default())
         })
     }
 }
@@ -1183,155 +1085,6 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IntoIter<T, M
 
 impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> FusedIterator for IntoIter<T, M, AUTO_FREE_IDS> {}
 
-/// Iterator over the contents of a `ThreadLocal`.
-#[derive(Debug)]
-pub struct IterMeta<'a, T: Send + Sync, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
-    thread_local: &'a ThreadLocal<T, M, AUTO_FREE_IDS>,
-    raw: RawIter<GUARD_ACTIVE_ITERATOR>,
-    prev: *const Entry<T, M, AUTO_FREE_IDS>,
-}
-
-impl<'a, T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IterMeta<'a, T, M, AUTO_FREE_IDS> {
-    type Item = (&'a T, &'a M);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(prev) = unsafe { self.prev.as_ref() } {
-            // mark the previous entry as `READY` again as we are done using it at this point.
-            prev.guard.store(GUARD_READY, Ordering::Release);
-            let alt = prev.alternative_entry.load(Ordering::Acquire);
-            if let Some(alt) = unsafe { alt.as_ref() } {
-                let mut backoff = Backoff::new();
-                // this loop will only ever loop multiple times if the guard of the current entry
-                // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
-                // we have to wait on another iterator to use it.
-                loop {
-                    match alt.guard.compare_exchange(
-                        GUARD_READY,
-                        GUARD_ACTIVE_ITERATOR,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => {
-                            return Some((unsafe { &*(&*alt.value.get()).as_ptr() }, &alt.meta));
-                        }
-                        Err(guard) => {
-                            if guard == GUARD_UNINIT {
-                                return None;
-                            }
-                            if guard != GUARD_ACTIVE_ITERATOR {
-                                break;
-                            }
-                            backoff.snooze();
-                        }
-                    }
-                }
-
-                self.prev = alt as *const _;
-
-                return Some((unsafe { (&*alt.value.get()).assume_init_ref() }, &alt.meta));
-            }
-        }
-
-        self.raw.next(self.thread_local).map(|entry| {
-            self.prev = entry as *const _;
-
-            (unsafe { (&*entry.value.get()).assume_init_ref() }, &entry.meta)
-        })
-    }
-}
-
-impl<T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> FusedIterator for IterMeta<'_, T, M, AUTO_FREE_IDS> {}
-
-impl<T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> Drop for IterMeta<'_, T, M, AUTO_FREE_IDS> {
-    fn drop(&mut self) {
-        if let Some(prev) = unsafe { self.prev.as_ref() } {
-            prev.guard.store(GUARD_READY, Ordering::Release);
-        }
-    }
-}
-
-/// Mutable iterator over the contents of a `ThreadLocal`.
-pub struct IterMutMeta<'a, T: Send, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
-    thread_local: &'a mut ThreadLocal<T, M, AUTO_FREE_IDS>,
-    raw: RawIter<GUARD_ACTIVE_ITERATOR>,
-    prev: *const Entry<T, M, AUTO_FREE_IDS>,
-}
-
-impl<'a, T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IterMutMeta<'a, T, M, AUTO_FREE_IDS> {
-    type Item = (&'a mut T, &'a M);
-
-    fn next(&mut self) -> Option<(&'a mut T, &'a M)> {
-        if let Some(prev) = unsafe { self.prev.as_ref() } {
-            // mark the previous entry as `READY` again as we are done using it at this point.
-            prev.guard.store(GUARD_READY, Ordering::Release);
-            let alt = prev.alternative_entry.load(Ordering::Acquire);
-            if let Some(alt) = unsafe { alt.as_ref() } {
-                let mut backoff = Backoff::new();
-                // this loop will only ever loop multiple times if the guard of the current entry
-                // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
-                // we have to wait on another iterator to use it.
-                loop {
-                    match alt.guard.compare_exchange(
-                        GUARD_READY,
-                        GUARD_ACTIVE_ITERATOR,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => {
-                            return Some((unsafe { (&mut *alt.value.get()).assume_init_mut() }, &alt.meta));
-                        }
-                        Err(guard) => {
-                            if guard == GUARD_UNINIT {
-                                return None;
-                            }
-                            if guard != GUARD_ACTIVE_ITERATOR {
-                                break;
-                            }
-                            backoff.snooze();
-                        }
-                    }
-                }
-
-                self.prev = alt as *const _;
-
-                return Some((
-                    unsafe { (&mut *alt.value.get()).assume_init_mut() },
-                    unsafe { &alt.meta },
-                ));
-            }
-        }
-
-        self.raw.next_mut(self.thread_local).map(move |entry| {
-            self.prev = entry as *const _;
-
-            (
-                unsafe { (&mut *(&*entry).value.get()).assume_init_mut() },
-                unsafe { &(&*entry).meta },
-            )
-        })
-    }
-}
-
-impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> FusedIterator for IterMutMeta<'_, T, M, AUTO_FREE_IDS> {}
-
-impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Drop for IterMutMeta<'_, T, M, AUTO_FREE_IDS> {
-    fn drop(&mut self) {
-        if let Some(prev) = unsafe { self.prev.as_ref() } {
-            prev.guard.store(GUARD_READY, Ordering::Release);
-        }
-    }
-}
-
-// Manual impl so we don't call Debug on the ThreadLocal, as doing so would create a reference to
-// this thread's value that potentially aliases with a mutable reference we have given out.
-impl<'a, T: Send + fmt::Debug, M: Metadata, const AUTO_FREE_IDS: bool> fmt::Debug for IterMutMeta<'a, T, M, AUTO_FREE_IDS> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IterMutMeta")
-            .field("raw", &self.raw)
-            .finish()
-    }
-}
-
 fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Metadata>(size: usize, tid_manager: *const Mutex<ThreadIdManager>, bucket: usize) -> *mut Entry<T, M, AUTO_FREE_IDS> {
     Box::into_raw(
         (0..size)
@@ -1383,52 +1136,60 @@ mod tests {
     fn same_thread() {
         let create = make_create();
         let mut tls: ThreadLocal<usize, ()> = ThreadLocal::new();
-        assert_eq!(None, tls.get());
+        assert_eq!(None, tls.get().map(|entry| *entry.value()));
         assert_eq!("ThreadLocal { local_data: None }", format!("{:?}", &tls));
-        assert_eq!(0, *tls.get_or(|| create()));
-        assert_eq!(Some(&0), tls.get());
-        assert_eq!(0, *tls.get_or(|| create()));
-        assert_eq!(Some(&0), tls.get());
-        assert_eq!(0, *tls.get_or(|| create()));
-        assert_eq!(Some(&0), tls.get());
+        assert_eq!(0, *tls.get_or(|_| create(), |_| {}).value());
+        let tmp = tls.get();
+        assert_eq!(Some(&0), tmp.as_ref().map(|entry| entry.value()));
+        assert_eq!(0, *tls.get_or(|_| create(), |_| {}).value());
+        let tmp = tls.get();
+        assert_eq!(Some(&0), tmp.as_ref().map(|entry| entry.value()));
+        assert_eq!(0, *tls.get_or(|_| create(), |_| {}).value());
+        let tmp = tls.get();
+        assert_eq!(Some(&0), tmp.as_ref().map(|entry| entry.value()));
         assert_eq!("ThreadLocal { local_data: Some(0) }", format!("{:?}", &tls));
         tls.clear();
-        assert_eq!(None, tls.get());
+        assert_eq!(None, tls.get().map(|entry| *entry.value()));
     }
 
     #[test]
     fn different_thread() {
         let create = make_create();
         let tls = Arc::new(ThreadLocal::<usize, ()>::new());
-        assert_eq!(None, tls.get());
-        assert_eq!(0, *tls.get_or(|| create()));
-        assert_eq!(Some(&0), tls.get());
+        let tmp = tls.get();
+        assert_eq!(None, tmp.as_ref().map(|entry| entry.value()));
+        assert_eq!(0, *tls.get_or(|_| create(), |_| {}).value());
+        let tmp = tls.get();
+        assert_eq!(Some(&0), tmp.as_ref().map(|entry| entry.value()));
 
         let tls2 = tls.clone();
         let create2 = create.clone();
         thread::spawn(move || {
-            assert_eq!(None, tls2.get());
-            assert_eq!(1, *tls2.get_or(|| create2()));
-            assert_eq!(Some(&1), tls2.get());
+            let tmp = tls2.get();
+            assert_eq!(None, tmp.as_ref().map(|entry| entry.value()));
+            assert_eq!(1, *tls2.get_or(|_| create2(), |_| {}).value());
+            let tmp = tls2.get();
+            assert_eq!(Some(&1), tmp.as_ref().map(|entry| entry.value()));
         })
         .join()
         .unwrap();
 
-        assert_eq!(Some(&0), tls.get());
-        assert_eq!(0, *tls.get_or(|| create()));
+        let tmp = tls.get();
+        assert_eq!(Some(&0), tmp.as_ref().map(|entry| entry.value()));
+        assert_eq!(0, *tls.get_or(|_| create(), |_| {}).value());
     }
 
     #[test]
     fn iter() {
         let tls = Arc::new(ThreadLocal::<Box<i32>, ()>::new());
-        tls.get_or(|| Box::new(1));
+        tls.get_or(|_| Box::new(1), |_| {});
 
         let tls2 = tls.clone();
         thread::spawn(move || {
-            tls2.get_or(|| Box::new(2));
+            tls2.get_or(|_| Box::new(2), |_| {});
             let tls3 = tls2.clone();
             thread::spawn(move || {
-                tls3.get_or(|| Box::new(3));
+                tls3.get_or(|_| Box::new(3), |_| {});
             })
             .join()
             .unwrap();
@@ -1443,14 +1204,14 @@ mod tests {
         let mut v = tls
             .iter()
             .map(|x| {
-                println!("found: {}", x);
-                **x
+                println!("found: {}", x.value());
+                **x.value()
             })
             .collect::<Vec<i32>>();
         v.sort_unstable();
         assert_eq!(vec![1], v);
 
-        let mut v = tls.iter_mut().map(|x| **x).collect::<Vec<i32>>();
+        let mut v = tls.iter_mut().map(|x| **x.value()).collect::<Vec<i32>>();
         v.sort_unstable();
         assert_eq!(vec![1], v);
 
@@ -1470,7 +1231,7 @@ mod tests {
         }
 
         let dropped = Arc::new(AtomicUsize::new(0));
-        local.get_or(|| Dropped(dropped.clone()));
+        local.get_or(|_| Dropped(dropped.clone()), |_| {});
         assert_eq!(dropped.load(Relaxed), 0);
         drop(local);
         assert_eq!(dropped.load(Relaxed), 1);

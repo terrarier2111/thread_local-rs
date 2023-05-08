@@ -7,7 +7,6 @@
 
 use crate::{Entry, POINTER_WIDTH};
 use once_cell::sync::Lazy;
-use std::cell::{Cell, RefCell, UnsafeCell};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::process::abort;

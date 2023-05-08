@@ -1159,42 +1159,51 @@ impl<'a, T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IterMutMe
     type Item = (&'a mut T, &'a M);
 
     fn next(&mut self) -> Option<(&'a mut T, &'a M)> {
-        /*if let Some(prev) = unsafe { self.prev.as_ref() } {
+        if let Some(prev) = unsafe { self.prev.as_ref() } {
+            // mark the previous entry as `READY` again as we are done using it at this point.
+            prev.guard.store(GUARD_READY, Ordering::Release);
             let alt = prev.alternative_entry.load(Ordering::Acquire);
             if let Some(alt) = unsafe { alt.as_ref() } {
-                match alt.guard.compare_exchange(
-                    GUARD_READY,
-                    GUARD_ACTIVE_INTERNAL,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        return Some((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut());
-                    }
-                    Err(guard) => {
-                        if guard == GUARD_UNINIT {
-                            return None;
+                let mut backoff = Backoff::new();
+                // this loop will only ever loop multiple times if the guard of the current entry
+                // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
+                // we have to wait on another iterator to use it.
+                loop {
+                    match alt.guard.compare_exchange(
+                        GUARD_READY,
+                        GUARD_ACTIVE_ITERATOR,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            return Some((unsafe { (&mut *alt.value.get()).assume_init_mut() }, &alt.meta));
+                        }
+                        Err(guard) => {
+                            if guard == GUARD_UNINIT {
+                                return None;
+                            }
+                            if guard != GUARD_ACTIVE_ITERATOR {
+                                break;
+                            }
+                            backoff.snooze();
                         }
                     }
                 }
 
                 self.prev = alt as *const _;
 
-                (
-                    unsafe { &mut *(&mut *alt.value.get()).as_mut_ptr() },
+                return Some((
+                    unsafe { (&mut *alt.value.get()).assume_init_mut() },
                     unsafe { &alt.meta },
-                )
+                ));
             }
-            prev.guard.store(GUARD_READY, Ordering::Release);
-        }*/
+        }
+
         self.raw.next_mut(self.thread_local).map(move |entry| {
-            if let Some(prev) = unsafe { self.prev.as_ref() } { // FIXME: get rid of this once the thing above works!
-                prev.guard.store(GUARD_READY, Ordering::Release);
-            }
             self.prev = entry as *const _;
 
             (
-                unsafe { &mut *(&mut *(&*entry).value.get()).as_mut_ptr() },
+                unsafe { (&mut *(&*entry).value.get()).assume_init_mut() },
                 unsafe { &(&*entry).meta },
             )
         })

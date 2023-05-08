@@ -996,13 +996,47 @@ impl<'a, T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for It
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.raw.next(self.thread_local).map(|entry| {
-            if let Some(prev) = unsafe { self.prev.as_ref() } {
-                prev.guard.store(GUARD_READY, Ordering::Release);
+        if let Some(prev) = unsafe { self.prev.as_ref() } {
+            // mark the previous entry as `READY` again as we are done using it at this point.
+            prev.guard.store(GUARD_READY, Ordering::Release);
+            let alt = prev.alternative_entry.load(Ordering::Acquire);
+            if let Some(alt) = unsafe { alt.as_ref() } {
+                let mut backoff = Backoff::new();
+                // this loop will only ever loop multiple times if the guard of the current entry
+                // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
+                // we have to wait on another iterator to use it.
+                loop {
+                    match alt.guard.compare_exchange(
+                        GUARD_READY,
+                        GUARD_ACTIVE_ITERATOR,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            return Some(unsafe { (&*alt.value.get()).assume_init_ref() });
+                        }
+                        Err(guard) => {
+                            if guard == GUARD_UNINIT {
+                                return None;
+                            }
+                            if guard != GUARD_ACTIVE_ITERATOR {
+                                break;
+                            }
+                            backoff.snooze();
+                        }
+                    }
+                }
+
+                self.prev = alt as *const _;
+
+                return Some(unsafe { (&*alt.value.get()).assume_init_ref() });
             }
+        }
+
+        self.raw.next(self.thread_local).map(|entry| {
             self.prev = entry as *const _;
 
-            unsafe { &*(&*entry.value.get()).as_ptr() }
+            unsafe { (&*entry.value.get()).assume_init_ref() }
         })
     }
 }
@@ -1028,13 +1062,47 @@ impl<'a, T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IterMut<'
     type Item = &'a mut T;
 
     fn next(&mut self) -> Option<&'a mut T> {
-        self.raw.next_mut(self.thread_local).map(|entry| {
-            if let Some(prev) = unsafe { self.prev.as_ref() } {
-                prev.guard.store(GUARD_READY, Ordering::Release);
+        if let Some(prev) = unsafe { self.prev.as_ref() } {
+            // mark the previous entry as `READY` again as we are done using it at this point.
+            prev.guard.store(GUARD_READY, Ordering::Release);
+            let alt = prev.alternative_entry.load(Ordering::Acquire);
+            if let Some(alt) = unsafe { alt.as_ref() } {
+                let mut backoff = Backoff::new();
+                // this loop will only ever loop multiple times if the guard of the current entry
+                // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
+                // we have to wait on another iterator to use it.
+                loop {
+                    match alt.guard.compare_exchange(
+                        GUARD_READY,
+                        GUARD_ACTIVE_ITERATOR,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            return Some(unsafe { (&mut *alt.value.get()).assume_init_mut() });
+                        }
+                        Err(guard) => {
+                            if guard == GUARD_UNINIT {
+                                return None;
+                            }
+                            if guard != GUARD_ACTIVE_ITERATOR {
+                                break;
+                            }
+                            backoff.snooze();
+                        }
+                    }
+                }
+
+                self.prev = alt as *const _;
+
+                return Some(unsafe { (&mut *alt.value.get()).assume_init_mut() });
             }
+        }
+
+        self.raw.next_mut(self.thread_local).map(|entry| {
             self.prev = entry as *const _;
 
-            unsafe { &mut *(&mut *(&*entry).value.get()).as_mut_ptr() }
+            unsafe { (&mut *(&*entry).value.get()).assume_init_mut() }
         })
     }
 }
@@ -1127,13 +1195,47 @@ impl<'a, T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for It
     type Item = (&'a T, &'a M);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.raw.next(self.thread_local).map(|entry| {
-            if let Some(prev) = unsafe { self.prev.as_ref() } {
-                prev.guard.store(GUARD_READY, Ordering::Release);
+        if let Some(prev) = unsafe { self.prev.as_ref() } {
+            // mark the previous entry as `READY` again as we are done using it at this point.
+            prev.guard.store(GUARD_READY, Ordering::Release);
+            let alt = prev.alternative_entry.load(Ordering::Acquire);
+            if let Some(alt) = unsafe { alt.as_ref() } {
+                let mut backoff = Backoff::new();
+                // this loop will only ever loop multiple times if the guard of the current entry
+                // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
+                // we have to wait on another iterator to use it.
+                loop {
+                    match alt.guard.compare_exchange(
+                        GUARD_READY,
+                        GUARD_ACTIVE_ITERATOR,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            return Some((unsafe { &*(&*alt.value.get()).as_ptr() }, &alt.meta));
+                        }
+                        Err(guard) => {
+                            if guard == GUARD_UNINIT {
+                                return None;
+                            }
+                            if guard != GUARD_ACTIVE_ITERATOR {
+                                break;
+                            }
+                            backoff.snooze();
+                        }
+                    }
+                }
+
+                self.prev = alt as *const _;
+
+                return Some((unsafe { (&*alt.value.get()).assume_init_ref() }, &alt.meta));
             }
+        }
+
+        self.raw.next(self.thread_local).map(|entry| {
             self.prev = entry as *const _;
 
-            (unsafe { &*(&*entry.value.get()).as_ptr() }, &entry.meta)
+            (unsafe { (&*entry.value.get()).assume_init_ref() }, &entry.meta)
         })
     }
 }

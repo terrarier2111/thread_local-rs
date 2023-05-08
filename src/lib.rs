@@ -85,9 +85,8 @@ use std::mem::{size_of, transmute, MaybeUninit};
 use std::panic::UnwindSafe;
 use std::ptr;
 use std::ptr::{null_mut, NonNull, null};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, TryLockResult};
-use unreachable::UncheckedResultExt;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 // Use usize::BITS once it has stabilized and the MSRV has been bumped.
 #[cfg(target_pointer_width = "16")]
@@ -211,7 +210,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
 
         let free_list = self.free_list.load(Ordering::Acquire);
 
-        let mut backoff = Backoff::new();
+        let backoff = Backoff::new();
         loop {
             match unsafe { &*free_list }.free_list.try_lock() {
                 Ok(mut guard) => {
@@ -332,7 +331,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Drop for ThreadLocal<T, M,
 
             for entry in unfinished.into_iter() {
                 let entry = unsafe { &*entry };
-                let mut backoff = Backoff::new();
+                let backoff = Backoff::new();
                 while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE_EXTERNAL {
                     backoff.snooze();
                 }
@@ -566,51 +565,6 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         EntryToken(unsafe { NonNull::new_unchecked(entry_ptr.cast_mut()) }, Default::default())
     }
 
-    // FIXME: support insertion in alternative entries!
-    #[cold]
-    fn insert_with_meta<F: FnOnce(*const M) -> T, FM: FnOnce(&M)>(&self, f: F, fm: FM) -> (&T, &M) {
-        let thread = thread_id::get();
-        let bucket_atomic_ptr = unsafe { self.buckets.get_unchecked(thread.bucket) };
-        let bucket_ptr: *const _ = bucket_atomic_ptr.load(Ordering::Acquire);
-
-        // If the bucket doesn't already exist, we need to allocate it
-        let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket::<false, AUTO_FREE_IDS, T, M>(thread.bucket_size(), global_tid_manager(), 0);
-
-            match bucket_atomic_ptr.compare_exchange(
-                null_mut(),
-                new_bucket,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => new_bucket,
-                // If the bucket value changed (from null), that means
-                // another thread stored a new bucket before we could,
-                // and we can free our bucket and use that one instead
-                Err(bucket_ptr) => {
-                    unsafe { deallocate_bucket(new_bucket, thread.bucket_size()) }
-                    bucket_ptr
-                }
-            }
-        } else {
-            bucket_ptr
-        };
-
-        // Insert the new element into the bucket
-        let entry = unsafe { &*bucket_ptr.add(thread.index) };
-        let value_ptr = entry.value.get();
-        unsafe { value_ptr.write(MaybeUninit::new(f(&entry.meta as *const M))) };
-        if size_of::<M>() > 0 {
-            fm(&entry.meta);
-        }
-        entry
-            .free_list
-            .store(thread.free_list.cast_mut(), Ordering::Release);
-        entry.guard.store(GUARD_READY, Ordering::Release);
-
-        (unsafe { &*(&*value_ptr).as_ptr() }, &entry.meta)
-    }
-
     fn acquire_alternative_entry(&self) -> *const Entry<T, M, AUTO_FREE_IDS> {
         let id = self.alternative_entry_ids.lock().unwrap().alloc();
         let (bucket, bucket_size, index) = thread_id::id_into_parts(id);
@@ -682,48 +636,6 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
     /// threads are currently accessing their associated values.
     pub fn clear(&mut self) {
         *self = ThreadLocal::new();
-    }
-
-    /// SAFETY: The provided `val` has to point to an instance of
-    /// `T` that was returned by some call to this `ThreadLocal`.
-    #[inline]
-    pub unsafe fn val_meta_ptr_from_val(val: NonNull<T>) -> ValMetaPtr<T, M, AUTO_FREE_IDS> {
-        ValMetaPtr(NonNull::new_unchecked(
-            val.as_ptr()
-                .cast::<u8>()
-                .offset(memoffset::offset_of!(Entry::<T, M, AUTO_FREE_IDS>, value) as isize * -1)
-                .cast::<Entry<T, M, AUTO_FREE_IDS>>(),
-        ))
-    }
-}
-
-pub struct ValMetaPtr<T, M: Metadata, const AUTO_FREE_IDS: bool = true>(NonNull<Entry<T, M, AUTO_FREE_IDS>>);
-
-impl<T, M: Metadata, const AUTO_FREE_IDS: bool> ValMetaPtr<T, M, AUTO_FREE_IDS> {
-    #[inline]
-    pub fn val_ptr(self) -> NonNull<T> {
-        unsafe {
-            NonNull::new_unchecked(
-                self.0
-                    .as_ptr()
-                    .cast::<u8>()
-                    .add(memoffset::offset_of!(Entry::<T, M, AUTO_FREE_IDS>, value))
-                    .cast::<T>(),
-            )
-        }
-    }
-
-    #[inline]
-    pub fn meta_ptr(self) -> NonNull<M> {
-        unsafe {
-            NonNull::new_unchecked(
-                self.0
-                    .as_ptr()
-                    .cast::<u8>()
-                    .add(memoffset::offset_of!(Entry::<T, M, AUTO_FREE_IDS>, meta))
-                    .cast::<M>(),
-            )
-        }
     }
 }
 
@@ -807,7 +719,7 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
             while self.index < self.bucket_size {
                 let entry = unsafe { &*bucket.add(self.index) };
                 self.index += 1;
-                let mut backoff = Backoff::new();
+                let backoff = Backoff::new();
                 // this loop will only ever loop multiple times if the guard of the current entry
                 // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
                 // we have to wait on another iterator to use it.
@@ -903,7 +815,7 @@ impl<'a, T: Send + Sync, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for It
             prev.guard.store(GUARD_READY, Ordering::Release);
             let alt_ptr = prev.alternative_entry.load(Ordering::Acquire);
             if let Some(alt) = unsafe { alt_ptr.as_ref() } {
-                let mut backoff = Backoff::new();
+                let backoff = Backoff::new();
                 // this loop will only ever loop multiple times if the guard of the current entry
                 // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
                 // we have to wait on another iterator to use it.
@@ -969,7 +881,7 @@ impl<'a, T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IterMut<'
             prev.guard.store(GUARD_READY, Ordering::Release);
             let alt_ptr = prev.alternative_entry.load(Ordering::Acquire);
             if let Some(alt) = unsafe { alt_ptr.as_ref() } {
-                let mut backoff = Backoff::new();
+                let backoff = Backoff::new();
                 // this loop will only ever loop multiple times if the guard of the current entry
                 // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
                 // we have to wait on another iterator to use it.
@@ -1047,7 +959,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IntoIter<T, M
                     // FIXME: reduce code duplication with detachment helpers of entries from threads in `Entry`
                     let free_list = unsafe { &*entry }.free_list.load(Ordering::Acquire);
 
-                    let mut backoff = Backoff::new();
+                    let backoff = Backoff::new();
                     loop {
                         match unsafe { &*free_list }.free_list.try_lock() {
                             // FIXME: this can deref an already dealloced piece of memory.

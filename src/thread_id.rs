@@ -8,9 +8,8 @@
 use crate::{Entry, POINTER_WIDTH};
 use once_cell::sync::Lazy;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::process::abort;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::collections::{BinaryHeap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::mem;
 use std::ops::Deref;
@@ -101,11 +100,6 @@ pub(crate) fn global_tid_manager() -> *const Mutex<ThreadIdManager> {
     THREAD_ID_MANAGER.deref() as *const _
 }
 
-#[inline]
-pub(crate) unsafe fn cleanup_id(id: usize) {
-    THREAD_ID_MANAGER.lock().unwrap().free(id);
-}
-
 pub(crate) struct FreeList {
     pub(crate) dropping: AtomicBool,
     pub(crate) free_list: Mutex<HashMap<usize, EntryData>>,
@@ -121,7 +115,7 @@ impl FreeList {
 
     fn cleanup(&self) {
         self.dropping.store(true, Ordering::Release);
-        let mut free_list = self.free_list.lock();
+        let free_list = self.free_list.lock();
         let outstanding_shared = Box::new(AtomicUsize::new(usize::MAX));
         let mut outstanding = 0;
         for entry in free_list.unwrap().iter() {

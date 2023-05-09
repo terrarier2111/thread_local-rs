@@ -82,6 +82,7 @@ use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::mem;
 use std::mem::{size_of, transmute, MaybeUninit};
+use std::ops::Deref;
 use std::panic::UnwindSafe;
 use std::ptr;
 use std::ptr::{null_mut, NonNull, null};
@@ -531,11 +532,14 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         };
 
         // Insert the new element into the bucket
-        let entry_ptr = unsafe { bucket_ptr.add(thread.index) };
-        let mut entry = unsafe { &*entry_ptr };
+        let mut entry = unsafe { &*unsafe { bucket_ptr.add(thread.index) } };
 
+        // check if the entry isn't cleaned up automatically
         if entry.guard.load(Ordering::Acquire) == GUARD_FREE_MANUALLY {
-            // FIXME: do we have to support traversing alternative entries recursively?
+            // traverse alternative entries recursively until we find the end and can insert our new entry
+            while let Some(alt) = unsafe { entry.alternative_entry.load(Ordering::Acquire).as_ref() } {
+                entry = alt;
+            }
             let alt = self.acquire_alternative_entry();
             entry.alternative_entry.store(alt.cast_mut(), Ordering::Release);
             entry = unsafe { &*alt };
@@ -562,7 +566,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             .store(thread.free_list.cast_mut(), Ordering::Release);
         entry.guard.store(GUARD_READY, Ordering::Release);
 
-        EntryToken(unsafe { NonNull::new_unchecked(entry_ptr.cast_mut()) }, Default::default())
+        EntryToken(unsafe { NonNull::new_unchecked((entry_ptr as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default())
     }
 
     fn acquire_alternative_entry(&self) -> *const Entry<T, M, AUTO_FREE_IDS> {
@@ -595,7 +599,6 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             bucket_ptr
         };
 
-        // Insert the new element into the bucket
         unsafe { bucket_ptr.add(index) }
     }
 

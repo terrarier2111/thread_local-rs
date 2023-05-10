@@ -177,14 +177,18 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
         &self,
         cleanup: &mut SmallVec<[*const Entry<T, M, AUTO_FREE_IDS>; N]>,
     ) {
-        let alt = self.alternative_entry.load(Ordering::Acquire);
+        let mut alt = self.alternative_entry.load(Ordering::Acquire);
 
-        if let Some(alt) = alt.as_ref() {
-            if !alt.free_list.load(Ordering::Acquire).is_null() {
-                if !alt.try_detach_thread_locally() {
-                    cleanup.push(alt as *const _);
-                }
+        while let Some(alt_ref) = alt.as_ref() {
+            if !alt_ref.free_list.load(Ordering::Acquire).is_null() {
+                break;
             }
+
+            if !alt_ref.try_detach_thread_locally() {
+                cleanup.push(alt.cast_const());
+            }
+
+            alt = alt_ref.alternative_entry.load(Ordering::Acquire);
         }
 
         if !self.try_detach_thread_locally() {
@@ -209,6 +213,10 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
             return val != GUARD_ACTIVE_EXTERNAL;
         }
 
+        self.remove_from_freelist()
+    }
+
+    fn remove_from_freelist(&self) -> bool {
         let free_list = self.free_list.load(Ordering::Acquire);
 
         let backoff = Backoff::new();
@@ -501,7 +509,6 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         }
     }
 
-    // FIXME: support insertion in alternative entries!
     #[cold]
     fn insert<F: FnOnce(*const M) -> T, FM: FnOnce(&M)>(&self, f: F, fm: FM) -> EntryToken<RefAccess, T, M, AUTO_FREE_IDS> {
         let thread = thread_id::get();
@@ -566,7 +573,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             .store(thread.free_list.cast_mut(), Ordering::Release);
         entry.guard.store(GUARD_READY, Ordering::Release);
 
-        EntryToken(unsafe { NonNull::new_unchecked((entry_ptr as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default())
+        EntryToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default())
     }
 
     fn acquire_alternative_entry(&self) -> *const Entry<T, M, AUTO_FREE_IDS> {
@@ -689,7 +696,6 @@ impl<T: Send + fmt::Debug, M: Metadata, const AUTO_FREE_IDS: bool> fmt::Debug fo
 
 impl<T: Send + UnwindSafe, M: Metadata, const AUTO_FREE_IDS: bool> UnwindSafe for ThreadLocal<T, M, AUTO_FREE_IDS> {}
 
-// FIXME: support alternative_entry
 #[derive(Debug)]
 struct RawIter<const NEW_GUARD: usize> {
     bucket: usize,
@@ -959,38 +965,15 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IntoIter<T, M
                 Some(entry) => {
                     // remove the entry from the freelist as we are freeing it already.
 
-                    // FIXME: reduce code duplication with detachment helpers of entries from threads in `Entry`
-                    let free_list = unsafe { &*entry }.free_list.load(Ordering::Acquire);
-
-                    let backoff = Backoff::new();
-                    loop {
-                        match unsafe { &*free_list }.free_list.try_lock() {
-                            // FIXME: this can deref an already dealloced piece of memory.
-                            Ok(mut guard) => {
-                                // we got the lock and can now remove our entry from the free list
-                                guard.remove(&(entry as usize));
-                                let ret = unsafe {
-                                    mem::replace(
-                                        &mut *(&*entry).value.get(),
-                                        MaybeUninit::uninit(),
-                                    )
-                                    .assume_init()
-                                };
-                                return Some(ret);
-                            }
-                            Err(_) => {
-                                // check if the thread declared that it was dropping, if so give up and try finding a new entry
-                                if unsafe { &*free_list }.dropping.load(Ordering::Acquire) {
-                                    unsafe { &*entry }
-                                        .guard
-                                        .store(GUARD_READY, Ordering::Release);
-                                    // try finding a new entry
-                                    break;
-                                }
-                                // FIXME: do we have a better way to wait (but be able to see a change in dropping)
-                                backoff.snooze();
-                            }
-                        }
+                    if unsafe { &*entry }.remove_from_freelist() {
+                        let ret = unsafe {
+                            mem::replace(
+                                &mut *(&*entry).value.get(),
+                                MaybeUninit::uninit(),
+                            )
+                                .assume_init()
+                        };
+                        return Some(ret);
                     }
                 }
             }
@@ -1115,7 +1098,6 @@ mod tests {
 
         let mut tls = Arc::try_unwrap(tls).unwrap();
 
-        // FIXME: there is a race condition with one of these 3 iterators!
         let mut v = tls
             .iter()
             .map(|x| {

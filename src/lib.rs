@@ -124,7 +124,7 @@ const GUARD_ACTIVE_ITERATOR: usize = 5;
 const GUARD_FREE_MANUALLY: usize = 6;
 
 #[derive(PartialEq)]
-pub struct EntryToken<'a, ACCESS, T, M: Metadata, const AUTO_FREE_IDS: bool>(NonNull<Entry<T, M, AUTO_FREE_IDS>>, PhantomData<&'a ACCESS>);
+pub struct EntryToken<'a, ACCESS, T, M: Metadata = (), const AUTO_FREE_IDS: bool = true>(NonNull<Entry<T, M, AUTO_FREE_IDS>>, PhantomData<&'a ACCESS>);
 
 impl<'a, ACCESS, T, M: Metadata, const AUTO_FREE_IDS: bool> EntryToken<'a, ACCESS, T, M, AUTO_FREE_IDS> {
 

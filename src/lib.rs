@@ -123,6 +123,22 @@ const GUARD_ACTIVE_EXTERNAL: usize = 4;
 const GUARD_ACTIVE_ITERATOR: usize = 5;
 const GUARD_FREE_MANUALLY: usize = 6;
 
+pub struct UnsafeToken<ACCESS, T, M: Metadata, const AUTO_FREE_IDS: bool>(NonNull<Entry<T, M, AUTO_FREE_IDS>>);
+
+impl<ACCESS, T, M: Metadata, const AUTO_FREE_IDS: bool> UnsafeToken<ACCESS, T, M, AUTO_FREE_IDS> {
+
+    #[inline]
+    pub fn value(&self) -> &T {
+        unsafe { (&*self.0.as_ref().value.get()).assume_init_ref() }
+    }
+
+    #[inline]
+    pub fn meta(&self) -> &M {
+        unsafe { &self.0.as_ref().meta }
+    }
+
+}
+
 #[derive(PartialEq)]
 pub struct EntryToken<'a, ACCESS, T, M: Metadata = (), const AUTO_FREE_IDS: bool = true>(NonNull<Entry<T, M, AUTO_FREE_IDS>>, PhantomData<&'a ACCESS>);
 
@@ -141,6 +157,11 @@ impl<'a, ACCESS, T, M: Metadata, const AUTO_FREE_IDS: bool> EntryToken<'a, ACCES
     /// SAFETY: This may only be called after the thread associated with this thread local has finished.
     pub unsafe fn destruct(self) {
         unsafe { self.0.as_ref().free_id(); }
+    }
+
+    #[inline]
+    pub unsafe fn into_unsafe_token(self) -> UnsafeToken<ACCESS, T, M, AUTO_FREE_IDS> {
+        UnsafeToken(self.0)
     }
 
 }

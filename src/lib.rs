@@ -123,9 +123,9 @@ const GUARD_ACTIVE_EXTERNAL: usize = 4;
 const GUARD_ACTIVE_ITERATOR: usize = 5;
 const GUARD_FREE_MANUALLY: usize = 6;
 
-pub struct UnsafeToken<ACCESS, T, M: Metadata, const AUTO_FREE_IDS: bool>(NonNull<Entry<T, M, AUTO_FREE_IDS>>);
+pub struct UnsafeToken<T, M: Metadata, const AUTO_FREE_IDS: bool>(NonNull<Entry<T, M, AUTO_FREE_IDS>>);
 
-impl<ACCESS, T, M: Metadata, const AUTO_FREE_IDS: bool> UnsafeToken<ACCESS, T, M, AUTO_FREE_IDS> {
+impl<T, M: Metadata, const AUTO_FREE_IDS: bool> UnsafeToken<T, M, AUTO_FREE_IDS> {
 
     #[inline]
     pub fn value(&self) -> &T {
@@ -135,6 +135,11 @@ impl<ACCESS, T, M: Metadata, const AUTO_FREE_IDS: bool> UnsafeToken<ACCESS, T, M
     #[inline]
     pub fn meta(&self) -> &M {
         unsafe { &self.0.as_ref().meta }
+    }
+
+    /// SAFETY: This may only be called after the thread associated with this thread local has finished.
+    pub unsafe fn destruct(self) {
+        unsafe { self.0.as_ref().free_id(); }
     }
 
 }
@@ -160,7 +165,7 @@ impl<'a, ACCESS, T, M: Metadata, const AUTO_FREE_IDS: bool> EntryToken<'a, ACCES
     }
 
     #[inline]
-    pub unsafe fn into_unsafe_token(self) -> UnsafeToken<ACCESS, T, M, AUTO_FREE_IDS> {
+    pub unsafe fn into_unsafe_token(self) -> UnsafeToken<T, M, AUTO_FREE_IDS> {
         UnsafeToken(self.0)
     }
 

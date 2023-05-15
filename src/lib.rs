@@ -196,7 +196,7 @@ pub struct RefAccess;
 
 // FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
 struct Entry<T, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
-    tid_manager: *const Mutex<ThreadIdManager>,
+    tid_manager: *const Mutex<ThreadIdManager>, // FIXME: can this be NonNull?
     id: usize,
     guard: AtomicUsize,
     alternative_entry: AtomicPtr<Entry<T, M, AUTO_FREE_IDS>>,
@@ -512,7 +512,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
     pub fn get_or<F, MF>(&self, create: F, meta: MF) -> EntryToken<'_, RefAccess, T, M, AUTO_FREE_IDS>
     where
         F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T,
-        MF: FnOnce(&M),
+        MF: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>),
     {
         let thread = thread_id::get();
         if let Some(val) = self.get_inner(thread) {
@@ -546,7 +546,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
     }
 
     #[cold]
-    fn insert<F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T, FM: FnOnce(&M)>(&self, f: F, fm: FM) -> EntryToken<RefAccess, T, M, AUTO_FREE_IDS> {
+    fn insert<F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T, FM: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>)>(&self, f: F, fm: FM) -> EntryToken<RefAccess, T, M, AUTO_FREE_IDS> {
         let thread = thread_id::get();
         let bucket_atomic_ptr = unsafe { self.buckets.get_unchecked(thread.bucket) };
         let bucket_ptr: *const _ = bucket_atomic_ptr.load(Ordering::Acquire);
@@ -591,7 +591,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         let value_ptr = entry.value.get();
         unsafe { value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()))))) };
         if size_of::<M>() > 0 {
-            fm(&entry.meta);
+            fm(EntryToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default()));
         }
         let cleanup_fn = Entry::<T, M, AUTO_FREE_IDS>::cleanup;
         unsafe { thread.free_list.as_ref().unwrap_unchecked() }

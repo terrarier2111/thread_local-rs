@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::mem;
 use std::ops::Deref;
+use std::ptr::NonNull;
 
 /// Thread ID manager which allocates thread IDs. It attempts to aggressively
 /// reuse thread IDs where possible to avoid cases where a ThreadLocal grows
@@ -96,8 +97,8 @@ pub(crate) fn id_into_parts(id: usize) -> (usize, usize, usize) {
 }
 
 #[inline]
-pub(crate) fn global_tid_manager() -> *const Mutex<ThreadIdManager> {
-    THREAD_ID_MANAGER.deref() as *const _
+pub(crate) fn global_tid_manager() -> NonNull<Mutex<ThreadIdManager>> {
+    unsafe { NonNull::new_unchecked((THREAD_ID_MANAGER.deref() as *const Mutex<ThreadIdManager>).cast_mut()) }
 }
 
 pub(crate) struct FreeList {

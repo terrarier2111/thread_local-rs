@@ -211,7 +211,7 @@ pub struct RefAccess;
 
 // FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
 struct Entry<T, M: Metadata = (), const AUTO_FREE_IDS: bool = true> {
-    tid_manager: *const Mutex<ThreadIdManager>, // FIXME: can this be NonNull?
+    tid_manager: NonNull<Mutex<ThreadIdManager>>,
     id: usize,
     guard: AtomicUsize,
     alternative_entry: AtomicPtr<Entry<T, M, AUTO_FREE_IDS>>,
@@ -334,7 +334,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
             }
         }
         // the tid_manager is either an `alternative` id manager or the `global` tid manager.
-        unsafe { self.tid_manager.as_ref().unwrap_unchecked() }.lock().unwrap().free(self.id);
+        unsafe { self.tid_manager.as_ref() }.lock().unwrap().free(self.id);
     }
 
 }
@@ -501,7 +501,8 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             .iter_mut()
             .enumerate()
         {
-            *bucket = allocate_bucket::<true, AUTO_FREE_IDS, T, M>(bucket_size, tid_manager.as_ref() as *const _, i);
+            let tid_manager = unsafe { NonNull::new_unchecked((tid_manager.as_ref() as *const Mutex<ThreadIdManager>).cast_mut()) };
+            *bucket = allocate_bucket::<true, AUTO_FREE_IDS, T, M>(bucket_size, tid_manager, i);
 
             if i != 0 {
                 bucket_size <<= 1;
@@ -636,7 +637,8 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket::<true, AUTO_FREE_IDS, T, M>(bucket_size, self.alternative_entry_ids.as_ref() as *const _, bucket);
+            let tid_manager = unsafe { NonNull::new_unchecked((self.alternative_entry_ids.as_ref() as *const Mutex<ThreadIdManager>).cast_mut()) };
+            let new_bucket = allocate_bucket::<true, AUTO_FREE_IDS, T, M>(bucket_size, tid_manager, bucket);
 
             match bucket_atomic_ptr.compare_exchange(
                 null_mut(),
@@ -1034,7 +1036,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IntoIter<T, M
 
 impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> FusedIterator for IntoIter<T, M, AUTO_FREE_IDS> {}
 
-fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Metadata>(size: usize, tid_manager: *const Mutex<ThreadIdManager>, bucket: usize) -> *mut Entry<T, M, AUTO_FREE_IDS> {
+fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Metadata>(size: usize, tid_manager: NonNull<Mutex<ThreadIdManager>>, bucket: usize) -> *mut Entry<T, M, AUTO_FREE_IDS> {
     Box::into_raw(
         (0..size)
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {

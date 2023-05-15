@@ -128,12 +128,22 @@ pub struct UnsafeToken<T, M: Metadata, const AUTO_FREE_IDS: bool>(NonNull<Entry<
 impl<T, M: Metadata, const AUTO_FREE_IDS: bool> UnsafeToken<T, M, AUTO_FREE_IDS> {
 
     #[inline]
-    pub fn value(&self) -> &T {
+    pub unsafe fn value_ptr(&self) -> *const T {
+        unsafe { (&*self.0.as_ref().value.get()).as_ptr() }
+    }
+
+    #[inline]
+    pub unsafe fn value(&self) -> &T {
         unsafe { (&*self.0.as_ref().value.get()).assume_init_ref() }
     }
 
     #[inline]
-    pub fn meta(&self) -> &M {
+    pub unsafe fn meta_ptr(&self) -> *const M {
+        self.meta() as *const M
+    }
+
+    #[inline]
+    pub unsafe fn meta(&self) -> &M {
         unsafe { &self.0.as_ref().meta }
     }
 
@@ -501,7 +511,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
     /// exist.
     pub fn get_or<F, MF>(&self, create: F, meta: MF) -> EntryToken<'_, RefAccess, T, M, AUTO_FREE_IDS>
     where
-        F: FnOnce(*const M) -> T,
+        F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T,
         MF: FnOnce(&M),
     {
         let thread = thread_id::get();
@@ -536,7 +546,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
     }
 
     #[cold]
-    fn insert<F: FnOnce(*const M) -> T, FM: FnOnce(&M)>(&self, f: F, fm: FM) -> EntryToken<RefAccess, T, M, AUTO_FREE_IDS> {
+    fn insert<F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T, FM: FnOnce(&M)>(&self, f: F, fm: FM) -> EntryToken<RefAccess, T, M, AUTO_FREE_IDS> {
         let thread = thread_id::get();
         let bucket_atomic_ptr = unsafe { self.buckets.get_unchecked(thread.bucket) };
         let bucket_ptr: *const _ = bucket_atomic_ptr.load(Ordering::Acquire);
@@ -579,7 +589,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         }
 
         let value_ptr = entry.value.get();
-        unsafe { value_ptr.write(MaybeUninit::new(f(&entry.meta as *const M))) };
+        unsafe { value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()))))) };
         if size_of::<M>() > 0 {
             fm(&entry.meta);
         }

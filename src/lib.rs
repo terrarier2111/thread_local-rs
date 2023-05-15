@@ -123,6 +123,7 @@ const GUARD_ACTIVE_EXTERNAL: usize = 4;
 const GUARD_ACTIVE_ITERATOR: usize = 5;
 const GUARD_FREE_MANUALLY: usize = 6;
 
+#[derive(Clone)]
 pub struct UnsafeToken<T, M: Metadata, const AUTO_FREE_IDS: bool>(NonNull<Entry<T, M, AUTO_FREE_IDS>>);
 
 impl<T, M: Metadata, const AUTO_FREE_IDS: bool> UnsafeToken<T, M, AUTO_FREE_IDS> {

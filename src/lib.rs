@@ -153,6 +153,11 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> UnsafeToken<T, M, AUTO_FREE_IDS>
         unsafe { self.0.as_ref().free_id(); }
     }
 
+    #[inline]
+    pub fn duplicate(&self) -> Self {
+        Self(self.0.clone())
+    }
+
 }
 
 #[derive(PartialEq)]

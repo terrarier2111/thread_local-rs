@@ -190,6 +190,15 @@ impl<'a, T, M: Metadata, const AUTO_FREE_IDS: bool> EntryToken<'a, MutRefAccess,
 
 }
 
+impl<'a, T, M: Metadata, const AUTO_FREE_IDS: bool> Clone for EntryToken<'a, RefAccess, T, M, AUTO_FREE_IDS> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self(self.0.clone(), PhantomData::default())
+    }
+}
+
+impl<'a, T, M: Metadata, const AUTO_FREE_IDS: bool> Copy for EntryToken<'a, RefAccess, T, M, AUTO_FREE_IDS> {}
+
 pub struct MutRefAccess;
 
 pub struct RefAccess;

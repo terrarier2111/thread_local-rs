@@ -486,7 +486,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         let mut buckets = [null_mut(); BUCKETS];
         let mut bucket_size = 1;
         for (i, bucket) in buckets[..allocated_buckets].iter_mut().enumerate() {
-            *bucket = allocate_bucket::<false, AUTO_FREE_IDS, T, M>(bucket_size, global_tid_manager(), 0);
+            *bucket = allocate_bucket::<false, AUTO_FREE_IDS, T, M>(bucket_size, global_tid_manager(), i);
 
             if i != 0 {
                 bucket_size <<= 1;
@@ -1040,17 +1040,14 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IntoIter<T, M
 impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> FusedIterator for IntoIter<T, M, AUTO_FREE_IDS> {}
 
 fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Metadata>(size: usize, tid_manager: NonNull<Mutex<ThreadIdManager>>, bucket: usize) -> *mut Entry<T, M, AUTO_FREE_IDS> {
-    if size >= usize::MAX / 2 {
-        panic!("too large alloc {} in bucket {} alt {}", size, bucket, ALTERNATIVE);
-    }
     Box::into_raw(
         (0..size)
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
                 tid_manager,
-                id: if ALTERNATIVE {
+                id: {
                     // we need to offset all entries by the number of all entries of previous buckets
                     (1 << (bucket + 1)) - 1 + n
-                } else { usize::MAX },
+                },
                 guard: AtomicUsize::new(GUARD_UNINIT),
                 alternative_entry: AtomicPtr::new(null_mut()),
                 free_list: Default::default(),

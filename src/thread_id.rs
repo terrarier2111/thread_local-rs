@@ -36,6 +36,9 @@ impl ThreadIdManager {
             id.0
         } else {
             let id = self.free_from;
+            if id >= usize::MAX / 2 {
+                println!("alloced ginormous id: {}", id);
+            }
             self.free_from = self
                 .free_from
                 .checked_add(1)

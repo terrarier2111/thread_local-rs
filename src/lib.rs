@@ -1037,6 +1037,9 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> Iterator for IntoIter<T, M
 impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> FusedIterator for IntoIter<T, M, AUTO_FREE_IDS> {}
 
 fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Metadata>(size: usize, tid_manager: NonNull<Mutex<ThreadIdManager>>, bucket: usize) -> *mut Entry<T, M, AUTO_FREE_IDS> {
+    if size >= usize::MAX / 2 {
+        panic!("too large alloc");
+    }
     Box::into_raw(
         (0..size)
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {

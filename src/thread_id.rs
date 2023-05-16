@@ -45,9 +45,6 @@ impl ThreadIdManager {
     }
 
     pub(crate) fn free(&mut self, id: usize) {
-        if id >= usize::MAX / 2 {
-            panic!("too large id: {}", id);
-        }
         self.free_list.push(Reverse(id));
     }
 }
@@ -73,10 +70,6 @@ impl Thread {
         let bucket = usize::from(POINTER_WIDTH) - id.leading_zeros() as usize;
         let bucket_size = 1 << bucket.saturating_sub(1);
         let index = if id != 0 { id ^ bucket_size } else { 0 };
-
-        if bucket == 64 {
-            println!("creation id: {}", id);
-        }
 
         Self {
             id,

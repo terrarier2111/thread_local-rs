@@ -569,9 +569,6 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            if thread.bucket == 64 {
-                println!("id: {}", thread.id);
-            }
             let new_bucket = allocate_bucket::<false, AUTO_FREE_IDS, T, M>(thread.bucket_size(), global_tid_manager(), thread.bucket);
 
             match bucket_atomic_ptr.compare_exchange(

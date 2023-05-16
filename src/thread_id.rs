@@ -33,9 +33,6 @@ impl ThreadIdManager {
 
     pub(crate) fn alloc(&mut self) -> usize {
         if let Some(id) = self.free_list.pop() {
-            if id.0 >= usize::MAX / 2 {
-                println!("found ginormous id: {}", id.0);
-            }
             id.0
         } else {
             let id = self.free_from;
@@ -51,6 +48,9 @@ impl ThreadIdManager {
     }
 
     pub(crate) fn free(&mut self, id: usize) {
+        if id >= usize::MAX / 2 {
+            panic!("too large id: {}", id);
+        }
         self.free_list.push(Reverse(id));
     }
 }

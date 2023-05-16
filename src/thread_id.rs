@@ -71,6 +71,10 @@ impl Thread {
         let bucket_size = 1 << bucket.saturating_sub(1);
         let index = if id != 0 { id ^ bucket_size } else { 0 };
 
+        if bucket == 64 {
+            println!("creation id: {}", id);
+        }
+
         Self {
             id,
             bucket,

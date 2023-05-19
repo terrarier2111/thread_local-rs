@@ -128,14 +128,18 @@ pub struct UnsafeToken<T, M: Metadata, const AUTO_FREE_IDS: bool>(NonNull<Entry<
 
 impl<T, M: Metadata, const AUTO_FREE_IDS: bool> UnsafeToken<T, M, AUTO_FREE_IDS> {
 
+    /// This is `MaybeUninit<T>` instead of `T` because when `UnsafeToken` is handed out
+    /// in the first closure of`get_or` the value is still uninitialized.
     #[inline]
-    pub unsafe fn value_ptr(&self) -> *const T {
+    pub unsafe fn value_ptr(&self) -> *const MaybeUninit<T> {
         unsafe { (&*self.0.as_ref().value.get()).as_ptr() }
     }
 
+    /// This is `MaybeUninit<T>` instead of `T` because when `UnsafeToken` is handed out
+    /// in the first closure of`get_or` the value is still uninitialized.
     #[inline]
-    pub unsafe fn value(&self) -> &T {
-        unsafe { (&*self.0.as_ref().value.get()).assume_init_ref() }
+    pub unsafe fn value(&self) -> &MaybeUninit<T> {
+        unsafe { &&*self.0.as_ref().value.get() }
     }
 
     #[inline]
@@ -608,7 +612,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         }
 
         let value_ptr = entry.value.get();
-        unsafe { value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()))))) }; // FIXME: in UnsafeToken document that acquiring a reference to its value is inherently unsafe until the first closure in get_or finishes.
+        unsafe { value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()))))) };
         if size_of::<M>() > 0 {
             fm(EntryToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default()));
         }

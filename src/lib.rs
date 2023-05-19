@@ -629,6 +629,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
     }
 
     fn acquire_alternative_entry(&self) -> *const Entry<T, M, AUTO_FREE_IDS> {
+        println!("try acquire alternative entry!");
         let id = self.alternative_entry_ids.lock().unwrap().alloc();
         let (bucket, bucket_size, index) = thread_id::id_into_parts(id);
 

@@ -132,7 +132,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> UnsafeToken<T, M, AUTO_FREE_IDS>
     /// in the first closure of`get_or` the value is still uninitialized.
     #[inline]
     pub unsafe fn value_ptr(&self) -> *const MaybeUninit<T> {
-        unsafe { (&*self.0.as_ref().value.get()).as_ptr() }
+        unsafe { &*self.0.as_ref().value.get() as *const MaybeUninit<T> }
     }
 
     /// This is `MaybeUninit<T>` instead of `T` because when `UnsafeToken` is handed out

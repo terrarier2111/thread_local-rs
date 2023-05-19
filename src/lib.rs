@@ -121,7 +121,7 @@ const GUARD_READY: usize = 2;
 const GUARD_ACTIVE_INTERNAL: usize = 3;
 const GUARD_ACTIVE_EXTERNAL: usize = 4;
 const GUARD_ACTIVE_ITERATOR: usize = 5;
-const GUARD_FREE_MANUALLY: usize = 6;
+const GUARD_FREE_MANUALLY: usize = 6; // FIXME: if we store this once, when are we able to reuse the entry again?
 
 #[derive(Clone)]
 pub struct UnsafeToken<T, M: Metadata, const AUTO_FREE_IDS: bool>(NonNull<Entry<T, M, AUTO_FREE_IDS>>);
@@ -632,7 +632,6 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
     }
 
     fn acquire_alternative_entry(&self) -> *const Entry<T, M, AUTO_FREE_IDS> {
-        println!("try acquire alternative entry!");
         let id = self.alternative_entry_ids.lock().unwrap().alloc();
         let (bucket, bucket_size, index) = thread_id::id_into_parts(id);
 
@@ -663,7 +662,9 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             bucket_ptr
         };
 
-        unsafe { bucket_ptr.add(index) }
+        let ret = unsafe { bucket_ptr.add(index) };
+        println!("acquired alternative entry: {:?}", ret);
+        ret
     }
 
     /// Returns an iterator over the local values of all threads in unspecified

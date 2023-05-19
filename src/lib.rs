@@ -231,6 +231,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
         let mut alt = self.alternative_entry.load(Ordering::Acquire);
 
         while let Some(alt_ref) = alt.as_ref() {
+            // when its freelist is non-null, we know that the entry is active
             if !alt_ref.free_list.load(Ordering::Acquire).is_null() {
                 break;
             }
@@ -535,6 +536,8 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             return val;
         }
 
+        println!("failed fetching entry of: {}", thread.id);
+
         self.insert(create, meta)
     }
 
@@ -605,7 +608,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         }
 
         let value_ptr = entry.value.get();
-        unsafe { value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()))))) };
+        unsafe { value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()))))) }; // FIXME: in UnsafeToken document that acquiring a reference to its value is inherently unsafe until the first closure in get_or finishes.
         if size_of::<M>() > 0 {
             fm(EntryToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default()));
         }

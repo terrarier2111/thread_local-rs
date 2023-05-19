@@ -635,7 +635,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         let id = self.alternative_entry_ids.lock().unwrap().alloc();
         let (bucket, bucket_size, index) = thread_id::id_into_parts(id);
 
-        let bucket_atomic_ptr = unsafe { self.buckets.get_unchecked(bucket) };
+        let bucket_atomic_ptr = unsafe { self.alternative_buckets.get_unchecked(bucket) };
         let bucket_ptr: *const _ = bucket_atomic_ptr.load(Ordering::Acquire);
 
         // If the bucket doesn't already exist, we need to allocate it

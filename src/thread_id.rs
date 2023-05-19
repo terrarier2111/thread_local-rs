@@ -126,6 +126,10 @@ impl FreeList {
             }
         }
 
+        // store the actual number of outstanding references and ensure that all
+        // updates that happened before are applied to the actual value after
+        // the initial store and cleanup the id if there are no actual outstanding
+        // references left after syncing the references.
         let prev = outstanding_shared.swap(outstanding, Ordering::Release);
         let diff = usize::MAX - prev;
         if diff > 0 {

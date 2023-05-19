@@ -296,6 +296,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
         }
     }
 
+    /// This will get called when the thread associated with this entry exits.
     pub(crate) unsafe fn cleanup(slf: *const Entry<()>, remaining_cnt: *const AtomicUsize) -> bool {
         let slf = unsafe { &*slf.cast::<Entry<T, M, AUTO_FREE_IDS>>() };
         let backoff = Backoff::new();
@@ -331,6 +332,10 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
 
     /// SAFETY: This may only be called after the thread associated with this thread local has finished.
     unsafe fn free_id(&self) {
+        // signal that there is no more manual cleanup required for future threads that get assigned this
+        // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
+        // even though the entry is completely unused.
+        self.guard.store(GUARD_EMPTY, Ordering::Release);
         // check if we are a "main" entry and our thread is finished
         if let Some(outstanding) = unsafe { self.outstanding_refs.load(Ordering::Acquire).as_ref() } {
             if outstanding.fetch_sub(1, Ordering::AcqRel) != 1 {

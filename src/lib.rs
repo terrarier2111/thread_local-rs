@@ -604,6 +604,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
 
         // Insert the new element into the bucket
         let mut entry = unsafe { &*unsafe { bucket_ptr.add(thread.index) } };
+        let entry_ptr = entry as *const Entry<T, M, AUTO_FREE_IDS>;
 
         // check if the entry isn't cleaned up automatically
         if entry.guard.load(Ordering::Acquire) == GUARD_FREE_MANUALLY {
@@ -614,6 +615,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             let alt = self.acquire_alternative_entry();
             entry.alternative_entry.store(alt.cast_mut(), Ordering::Release);
             entry = unsafe { &*alt };
+            println!("acquired alternative entry: {:?} (master entry: {:?})", alt, entry_ptr);
         }
 
         let value_ptr = entry.value.get();
@@ -671,9 +673,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             bucket_ptr
         };
 
-        let ret = unsafe { bucket_ptr.add(index) };
-        println!("acquired alternative entry: {:?}", ret);
-        ret
+        unsafe { bucket_ptr.add(index) }
     }
 
     /// Returns an iterator over the local values of all threads in unspecified

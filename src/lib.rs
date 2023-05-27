@@ -556,21 +556,25 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         if bucket_ptr.is_null() {
             return None;
         }
-        let entry_ptr = unsafe { bucket_ptr.add(thread.index) };
-        let entry = unsafe { &*entry_ptr };
-        let free_list = entry.free_list.load(Ordering::Acquire);
-        // check if the entry is usable (it has an init value and it's not a pseudo-present value)
-        if free_list.cast_const() == thread.free_list {
-            Some(EntryToken(unsafe { NonNull::new_unchecked(entry_ptr) }, Default::default()))
-        } else {
+        let mut entry_ptr = unsafe { bucket_ptr.add(thread.index) };
+        let mut entry = unsafe { &*entry_ptr };
+        let mut free_list = entry.free_list.load(Ordering::Acquire);
+
+        // check if the entry is unusable (it does not have an init value and it's not a pseudo-present value)
+        while free_list.cast_const() != thread.free_list {
             let alt_ptr = entry.alternative_entry.load(Ordering::Acquire);
-            // check if the entry has an alternative entry (and thus a pseudo-present value)
-            if !alt_ptr.is_null() {
-                Some(EntryToken(unsafe { NonNull::new_unchecked(alt_ptr) }, Default::default()))
-            } else {
-                None
+
+            // check if there is an alternative entry present
+            if alt_ptr.is_null() {
+                return None;
             }
+
+            entry_ptr = alt_ptr;
+            entry = unsafe { &*entry_ptr };
+            free_list = entry.free_list.load(Ordering::Acquire);
         }
+
+        Some(EntryToken(unsafe { NonNull::new_unchecked(alt_ptr) }, Default::default()))
     }
 
     #[cold]

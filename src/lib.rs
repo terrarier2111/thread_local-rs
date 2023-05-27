@@ -574,7 +574,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             free_list = entry.free_list.load(Ordering::Acquire);
         }
 
-        Some(EntryToken(unsafe { NonNull::new_unchecked(alt_ptr) }, Default::default()))
+        Some(EntryToken(unsafe { NonNull::new_unchecked(entry_ptr) }, Default::default()))
     }
 
     #[cold]

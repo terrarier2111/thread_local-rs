@@ -45,6 +45,13 @@ impl ThreadIdManager {
     }
 
     pub(crate) fn free(&mut self, id: usize) {
+        if self.free_list.iter().find(|x| x.0 == id).is_some() {
+            panic!("double freed tid!");
+        }
+        if self.free_from < id {
+            panic!("freed tid although tid was never handed out!");
+        }
+
         self.free_list.push(Reverse(id));
     }
 }

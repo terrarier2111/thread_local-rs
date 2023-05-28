@@ -48,7 +48,7 @@ impl ThreadIdManager {
         if self.free_list.iter().find(|x| x.0 == id).is_some() {
             panic!("double freed tid!");
         }
-        if self.free_from < id {
+        if self.free_from <= id {
             panic!("freed tid although tid was never handed out!");
         }
 

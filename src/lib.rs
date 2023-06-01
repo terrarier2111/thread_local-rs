@@ -1062,6 +1062,7 @@ fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Met
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
                 tid_manager,
                 id: {
+                    println!("calced id: {}[{}]: {}", bucket, n, (1 << (bucket + 1)) - 1 + n);
                     // we need to offset all entries by the number of all entries of previous buckets
                     (1 << (bucket + 1)) - 1 + n
                 },

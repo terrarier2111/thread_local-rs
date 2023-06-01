@@ -32,7 +32,7 @@ impl ThreadIdManager {
     }
 
     pub(crate) fn alloc(&mut self) -> usize {
-        if let Some(id) = self.free_list.pop() {
+        let ret = if let Some(id) = self.free_list.pop() {
             id.0
         } else {
             let id = self.free_from;
@@ -41,7 +41,11 @@ impl ThreadIdManager {
                 .checked_add(1)
                 .expect("Ran out of thread IDs");
             id
-        }
+        };
+
+        println!("alloced tid: {}", ret);
+
+        ret
     }
 
     pub(crate) fn free(&mut self, id: usize) {

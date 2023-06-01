@@ -143,7 +143,7 @@ impl FreeList {
             if outstanding_shared.fetch_sub(diff, Ordering::AcqRel) == diff {
                 // perform the actual cleanup of the id
                 let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
-                THREAD_ID_MANAGER.lock().unwrap().free(id);
+                THREAD_ID_MANAGER.lock().unwrap().free(id); // FIXME: this is not okay if we are an alternative_id or is it?
             }
         }
 
@@ -180,17 +180,17 @@ impl Drop for ThreadGuard {
     fn drop(&mut self) {
         unsafe {
             // first clean up all entries in the freelist
-            FREE_LIST.as_ref().unwrap_unchecked().cleanup();
+            FREE_LIST.as_ref().unwrap_unchecked().cleanup(); // FIXME: this causes invalid drops (maybe)
             // ... then clean up the freelist itself.
             FREE_LIST.take();
         }
         // Release the thread ID. Any further accesses to the thread ID
         // will go through get_slow which will either panic or
         // initialize a new ThreadGuard.
-        THREAD_ID_MANAGER
+        /*THREAD_ID_MANAGER
             .lock()
             .unwrap()
-            .free(unsafe { THREAD.as_ref().unwrap_unchecked().id });
+            .free(unsafe { THREAD.as_ref().unwrap_unchecked().id });*/ // FIXME: doesn't this lead to a double free of thread ids?
     }
 }
 

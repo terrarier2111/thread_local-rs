@@ -191,10 +191,10 @@ impl Drop for ThreadGuard {
         // Release the thread ID. Any further accesses to the thread ID
         // will go through get_slow which will either panic or
         // initialize a new ThreadGuard.
-        THREAD_ID_MANAGER
+        /*THREAD_ID_MANAGER
             .lock()
             .unwrap()
-            .free(unsafe { THREAD.as_ref().unwrap_unchecked().id }); // FIXME: doesn't this lead to a double free of thread ids?
+            .free(unsafe { THREAD.as_ref().unwrap_unchecked().id });*/ // FIXME: doesn't this lead to a double free of thread ids?
     }
 }
 

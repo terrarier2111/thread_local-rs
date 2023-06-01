@@ -1063,14 +1063,14 @@ fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Met
                 tid_manager,
                 id: {
                     println!("calced id: {}[{}]: {}", bucket, n, if bucket == 0 {
-                        1
+                        0
                     } else {
                         (1 << (bucket - 1)) - 1 + n
                     });
                     // we need to offset all entries by the number of all entries of previous buckets
                     // (1 << (bucket + 1)) - 1 + n
                     if bucket == 0 {
-                        1
+                        0
                     } else {
                         (1 << (bucket - 1)) - 1 + n
                     }

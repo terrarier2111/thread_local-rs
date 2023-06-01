@@ -49,7 +49,7 @@ impl ThreadIdManager {
             panic!("double freed tid!");
         }
         if self.free_from <= id {
-            panic!("freed tid although tid was never handed out!");
+            panic!("freed tid although tid was never handed out {}", id);
         }
 
         self.free_list.push(Reverse(id));
@@ -187,10 +187,10 @@ impl Drop for ThreadGuard {
         // Release the thread ID. Any further accesses to the thread ID
         // will go through get_slow which will either panic or
         // initialize a new ThreadGuard.
-        /*THREAD_ID_MANAGER
+        THREAD_ID_MANAGER
             .lock()
             .unwrap()
-            .free(unsafe { THREAD.as_ref().unwrap_unchecked().id });*/ // FIXME: doesn't this lead to a double free of thread ids?
+            .free(unsafe { THREAD.as_ref().unwrap_unchecked().id }); // FIXME: doesn't this lead to a double free of thread ids?
     }
 }
 

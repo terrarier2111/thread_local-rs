@@ -49,7 +49,7 @@ impl ThreadIdManager {
             panic!("double freed tid!");
         }
         if self.free_from <= id {
-            panic!("freed tid although tid was never handed out {} glob {:?} local {:?}", id, global_tid_manager(), self as *const ThreadIdManager);
+            panic!("freed tid although tid was never handed out {} max {} glob {:?} local {:?}", id, self.free_from, global_tid_manager(), self as *const ThreadIdManager);
         }
 
         self.free_list.push(Reverse(id));

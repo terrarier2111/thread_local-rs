@@ -498,9 +498,9 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         for (i, bucket) in buckets[..allocated_buckets].iter_mut().enumerate() {
             *bucket = allocate_bucket::<false, AUTO_FREE_IDS, T, M>(bucket_size, global_tid_manager(), i);
 
-            if i != 0 {
+            /*if i != 0 {
                 bucket_size <<= 1;
-            }
+            }*/
         }
 
         let tid_manager = Box::new(Mutex::new(ThreadIdManager::new()));
@@ -514,9 +514,9 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             let tid_manager = unsafe { NonNull::new_unchecked((tid_manager.as_ref() as *const Mutex<ThreadIdManager>).cast_mut()) };
             *bucket = allocate_bucket::<true, AUTO_FREE_IDS, T, M>(bucket_size, tid_manager, i);
 
-            if i != 0 {
+            /*if i != 0 {
                 bucket_size <<= 1;
-            }
+            }*/
         }
 
         Self {

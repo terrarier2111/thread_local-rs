@@ -343,7 +343,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
                 return;
             }
         }
-        println!("freeeeeeeing {} in {:?}", self.id, self.tid_manager);
+        println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
         // the tid_manager is either an `alternative` id manager or the `global` tid manager.
         unsafe { self.tid_manager.as_ref() }.lock().unwrap().free(self.id);
     }

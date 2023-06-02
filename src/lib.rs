@@ -343,7 +343,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
                 return;
             }
         }
-        println!("freeeeeeeing {}", self.id);
+        println!("freeeeeeeing {} in {:?}", self.id, self.tid_manager);
         // the tid_manager is either an `alternative` id manager or the `global` tid manager.
         unsafe { self.tid_manager.as_ref() }.lock().unwrap().free(self.id);
     }
@@ -1062,13 +1062,9 @@ fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Met
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
                 tid_manager,
                 id: {
-                    // special case the first bucket as the first two buckets both only have a single entry
-                    if bucket == 0 {
-                        0
-                    } else {
-                        // we need to offset all entries by the number of all entries of previous buckets
-                        (1 << (bucket - 1)) + n
-                    }
+                    // special case the first bucket as the first two buckets both only have a single entry (that's why the sub has to be saturating).
+                    // we need to offset all entries by the number of all entries of previous buckets.
+                    (1 << bucket.saturating_sub(1)) + n
                 },
                 guard: AtomicUsize::new(GUARD_UNINIT),
                 alternative_entry: AtomicPtr::new(null_mut()),

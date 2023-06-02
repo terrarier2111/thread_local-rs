@@ -545,6 +545,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             return val;
         }
 
+        println!("failed fetching entry of: {}", thread.id);
         self.insert(create, meta)
     }
 
@@ -617,6 +618,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             let alt = self.acquire_alternative_entry();
             entry.alternative_entry.store(alt.cast_mut(), Ordering::Release);
             entry = unsafe { &*alt };
+            println!("acquired alternative entry: {:?} (master entry: {:?})", alt, entry_ptr);
         }
 
         let value_ptr = entry.value.get();
@@ -674,7 +676,9 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             bucket_ptr
         };
 
-        unsafe { bucket_ptr.add(index) }
+        let ret = unsafe { bucket_ptr.add(index) };
+        println!("alt cache {:?} with id {}", ret, id);
+        ret
     }
 
     /// Returns an iterator over the local values of all threads in unspecified

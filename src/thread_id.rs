@@ -140,6 +140,7 @@ impl FreeList {
         let prev = outstanding_shared.swap(outstanding, Ordering::Release);
         let diff = usize::MAX - prev;
         if diff > 0 {
+            println!("racing diff {}", diff);
             if outstanding_shared.fetch_sub(diff, Ordering::AcqRel) == diff {
                 // perform the actual cleanup of the id
                 let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
@@ -148,6 +149,8 @@ impl FreeList {
                 // initialize a new ThreadGuard.
                 THREAD_ID_MANAGER.lock().unwrap().free(id);
             }
+        } else {
+            println!("no diff!");
         }
 
         mem::forget(outstanding);

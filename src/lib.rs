@@ -86,7 +86,7 @@ use std::ops::Deref;
 use std::panic::UnwindSafe;
 use std::ptr;
 use std::ptr::{null_mut, NonNull, null};
-use std::sync::atomic::{AtomicPtr, AtomicUsize, fence, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 // Use usize::BITS once it has stabilized and the MSRV has been bumped.
@@ -332,6 +332,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
 
     /// SAFETY: This may only be called after the thread associated with this thread local has finished.
     unsafe fn free_id(&self) {
+        println!("free_id call {}", self.id);
         // signal that there is no more manual cleanup required for future threads that get assigned this
         // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
         // even though the entry is completely unused.
@@ -343,7 +344,6 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
                 return;
             }
         }
-        fence(Ordering::Acquire);
         println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
         // the tid_manager is either an `alternative` id manager or the `global` tid manager.
         unsafe { self.tid_manager.as_ref() }.lock().unwrap().free(self.id);

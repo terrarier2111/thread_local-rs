@@ -612,6 +612,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
 
         // check if the entry isn't cleaned up automatically
         if entry.guard.load(Ordering::Acquire) == GUARD_FREE_MANUALLY {
+            println!("to be freed entry: freelist {:?} id {} tid_manager: {:?}", entry.free_list.load(Ordering::Acquire), entry.id, entry.tid_manager);
             // traverse alternative entries recursively until we find the end and can insert our new entry
             while let Some(alt) = unsafe { entry.alternative_entry.load(Ordering::Acquire).as_ref() } {
                 entry = alt;

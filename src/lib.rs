@@ -86,7 +86,7 @@ use std::ops::Deref;
 use std::panic::UnwindSafe;
 use std::ptr;
 use std::ptr::{null_mut, NonNull, null};
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, fence, Ordering};
 use std::sync::Mutex;
 
 // Use usize::BITS once it has stabilized and the MSRV has been bumped.
@@ -343,6 +343,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
                 return;
             }
         }
+        fence(Ordering::Acquire);
         println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
         // the tid_manager is either an `alternative` id manager or the `global` tid manager.
         unsafe { self.tid_manager.as_ref() }.lock().unwrap().free(self.id);

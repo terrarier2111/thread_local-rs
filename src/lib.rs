@@ -73,6 +73,7 @@
 mod thread_id;
 mod unreachable;
 
+use std::alloc::{alloc, dealloc, Layout};
 use crate::thread_id::{EntryData, FreeList, global_tid_manager, Thread, ThreadIdManager};
 use crossbeam_utils::Backoff;
 use smallvec::{smallvec, SmallVec};
@@ -109,7 +110,7 @@ pub struct ThreadLocal<T: Send, M: Metadata = (), const AUTO_FREE_IDS: bool = tr
     buckets: [AtomicPtr<Entry<T, M, AUTO_FREE_IDS>>; BUCKETS],
 
     alternative_buckets: [AtomicPtr<Entry<T, M, AUTO_FREE_IDS>>; BUCKETS],
-    alternative_entry_ids: Box<Mutex<ThreadIdManager>>,
+    alternative_entry_ids: SizedBox<Mutex<ThreadIdManager>>,
 }
 
 const GUARD_UNINIT: usize = 0;
@@ -505,7 +506,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             }
         }
 
-        let tid_manager = Box::new(Mutex::new(ThreadIdManager::new()));
+        let tid_manager = SizedBox::new(Mutex::new(ThreadIdManager::new()));
 
         let mut alternative_buckets = [null_mut(); BUCKETS];
         let mut bucket_size = 1;
@@ -649,7 +650,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
     }
 
     fn acquire_alternative_entry(&self) -> *const Entry<T, M, AUTO_FREE_IDS> {
-        let id = self.alternative_entry_ids.lock().unwrap().alloc();
+        let id = self.alternative_entry_ids.as_ref().lock().unwrap().alloc();
         let (bucket, bucket_size, index) = thread_id::id_into_parts(id);
 
         let bucket_atomic_ptr = unsafe { self.alternative_buckets.get_unchecked(bucket) };
@@ -1091,6 +1092,72 @@ impl Metadata for () {
     #[inline(always)]
     fn set_default(&self) {}
 }
+
+struct SizedBox<T> {
+    alloc_ptr: NonNull<T>,
+}
+
+impl<T> SizedBox<T> {
+    const LAYOUT: Layout = {
+        Layout::new::<T>()
+    };
+
+    fn new(val: T) -> Self {
+        // SAFETY: The layout we provided was checked at compiletime, so it has to be initialized correctly
+        let alloc = unsafe { alloc(Self::LAYOUT) }.cast::<T>();
+        // FIXME: add safety comment
+        unsafe {
+            alloc.write(val);
+        }
+        Self {
+            alloc_ptr: NonNull::new(alloc).unwrap(), // FIXME: can we make this unchecked?
+        }
+    }
+
+    #[inline]
+    fn as_ref(&self) -> &T {
+        // SAFETY: This is safe because we know that alloc_ptr can't be zero
+        // and because we know that alloc_ptr has to point to a valid
+        // instance of T in memory
+        unsafe { self.alloc_ptr.as_ref() }
+    }
+
+    #[inline]
+    fn as_mut(&mut self) -> &mut T {
+        // SAFETY: This is safe because we know that alloc_ptr can't be zero
+        // and because we know that alloc_ptr has to point to a valid
+        // instance of T in memory
+        unsafe { self.alloc_ptr.as_mut() }
+    }
+
+    #[inline]
+    fn into_ptr(self) -> NonNull<T> {
+        let ret = self.alloc_ptr;
+        mem::forget(self);
+        ret
+    }
+
+    #[inline]
+    unsafe fn from_ptr(ptr: NonNull<T>) -> Self {
+        Self { alloc_ptr: ptr }
+    }
+}
+
+impl<T> Drop for SizedBox<T> {
+    fn drop(&mut self) {
+        // SAFETY: This is safe to call because SizedBox can only be dropped once
+        unsafe {
+            ptr::drop_in_place(self.alloc_ptr.as_ptr());
+        }
+        // FIXME: add safety comment
+        unsafe {
+            dealloc(self.alloc_ptr.as_ptr().cast::<u8>(), SizedBox::<T>::LAYOUT);
+        }
+    }
+}
+
+unsafe impl<T: Send> Send for SizedBox<T> {}
+unsafe impl<T: Sync> Sync for SizedBox<T> {}
 
 #[cfg(test)]
 mod tests {

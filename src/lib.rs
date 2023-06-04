@@ -1065,10 +1065,10 @@ fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Met
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
                 tid_manager,
                 id: {
-                    println!("calced id: {}[{}]: {}", bucket, n, (1 << bucket.saturating_sub(1)) + n);
+                    println!("calced id: {}[{}]: {}", bucket, n, ((1 << bucket) >> 1) + n);
                     // special case the first bucket as the first two buckets both only have a single entry (that's why the sub has to be saturating).
                     // we need to offset all entries by the number of all entries of previous buckets.
-                    (1 << bucket.saturating_sub(1)) + n
+                    ((1 << bucket) >> 1) + n
                 },
                 guard: AtomicUsize::new(GUARD_UNINIT),
                 alternative_entry: AtomicPtr::new(null_mut()),

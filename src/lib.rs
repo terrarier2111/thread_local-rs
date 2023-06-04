@@ -1065,6 +1065,7 @@ fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Met
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
                 tid_manager,
                 id: {
+                    println!("calced id: {}[{}]: {}", bucket, n, (1 << bucket.saturating_sub(1)) + n);
                     // special case the first bucket as the first two buckets both only have a single entry (that's why the sub has to be saturating).
                     // we need to offset all entries by the number of all entries of previous buckets.
                     (1 << bucket.saturating_sub(1)) + n
@@ -1110,7 +1111,7 @@ impl<T> SizedBox<T> {
             alloc.write(val);
         }
         Self {
-            alloc_ptr: NonNull::new(alloc).unwrap(), // FIXME: can we make this unchecked?
+            alloc_ptr: NonNull::new(alloc).unwrap(),
         }
     }
 

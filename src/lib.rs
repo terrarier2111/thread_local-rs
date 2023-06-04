@@ -339,7 +339,8 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
         // even though the entry is completely unused.
         self.guard.store(GUARD_EMPTY, Ordering::Release);
         // check if we are a "main" entry and our thread is finished
-        if let Some(outstanding) = unsafe { self.outstanding_refs.load(Ordering::Acquire).as_ref() } {
+        let outstanding = self.outstanding_refs.load(Ordering::Acquire);
+        if let Some(outstanding) = unsafe { outstanding.as_ref() } {
             if outstanding.fetch_sub(1, Ordering::AcqRel) != 1 {
                 // there are outstanding references left, so we can't free the id yet.
                 return;

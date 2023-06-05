@@ -126,11 +126,11 @@ impl FreeList {
     fn cleanup(&self) {
         self.dropping.store(true, Ordering::Release);
         let free_list = self.free_list.lock();
-        let outstanding_shared = Box::new(AtomicUsize::new(usize::MAX));
+        let outstanding_shared = Box::into_raw(Box::new(AtomicUsize::new(usize::MAX)));
         let mut outstanding = 0;
         for entry in free_list.unwrap().iter() {
             // sum up all the "failed" cleanups
-            if unsafe { !entry.1.cleanup(*entry.0 as *const Entry<()>, outstanding_shared.deref() as *const AtomicUsize) } {
+            if unsafe { !entry.1.cleanup(*entry.0 as *const Entry<()>, outstanding_shared) } {
                 outstanding += 1;
             }
         }
@@ -139,11 +139,11 @@ impl FreeList {
         // updates that happened before are applied to the actual value after
         // the initial store and cleanup the id if there are no actual outstanding
         // references left after syncing the references.
-        let prev = outstanding_shared.swap(outstanding, Ordering::Release);
+        let prev = unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.swap(outstanding, Ordering::Release);
         let diff = usize::MAX - prev;
         if diff > 0 {
             println!("racing diff {}", diff);
-            if outstanding_shared.fetch_sub(diff, Ordering::AcqRel) == diff {
+            if unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.fetch_sub(diff, Ordering::AcqRel) == diff {
                 // perform the actual cleanup of the id
                 let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
                 // Release the thread ID. Any further accesses to the thread ID
@@ -154,8 +154,6 @@ impl FreeList {
         } else {
             println!("no diff!");
         }
-
-        mem::forget(outstanding_shared);
     }
 }
 

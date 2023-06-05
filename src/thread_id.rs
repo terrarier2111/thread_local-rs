@@ -155,7 +155,7 @@ impl FreeList {
             println!("no diff!");
         }
 
-        mem::forget(outstanding);
+        mem::forget(outstanding_shared);
     }
 }
 

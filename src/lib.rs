@@ -346,6 +346,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
                 return;
             }
             mem::forget(outstanding);
+            println!("free mem!");
             // free the memory again
             let _ = Box::from_raw(outstanding_ptr);
         }

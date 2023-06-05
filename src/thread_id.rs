@@ -144,6 +144,8 @@ impl FreeList {
         if diff > 0 {
             println!("racing diff {}", diff);
             if unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.fetch_sub(diff, Ordering::AcqRel) == diff {
+                // free the memory again
+                let _ = unsafe { Box::from_raw(outstanding_shared) };
                 // perform the actual cleanup of the id
                 let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
                 // Release the thread ID. Any further accesses to the thread ID

@@ -42,17 +42,17 @@ impl ThreadIdManager {
                 .expect("Ran out of thread IDs");
             id
         };
-        // println!("alloced tid: {}", ret);
+        println!("alloced tid: {}", ret);
         ret
     }
 
     pub(crate) fn free(&mut self, id: usize) {
-        /*if self.free_list.iter().find(|x| x.0 == id).is_some() {
+        if self.free_list.iter().find(|x| x.0 == id).is_some() {
             panic!("double freed tid!");
         }
         if self.free_from <= id {
             panic!("freed tid although tid was never handed out {} max {} glob {:?} local {:?}", id, self.free_from, global_tid_manager(), self as *const ThreadIdManager);
-        }*/
+        }
 
         self.free_list.push(Reverse(id));
     }
@@ -126,7 +126,7 @@ impl FreeList {
     fn cleanup(&self) {
         self.dropping.store(true, Ordering::Release);
         let free_list = self.free_list.lock();
-        // println!("alloced shared counter!");
+        println!("alloced shared counter!");
         let outstanding_shared = Box::into_raw(Box::new(AtomicUsize::new(usize::MAX)));
         let mut outstanding = 0;
         for entry in free_list.unwrap().iter() {
@@ -143,7 +143,7 @@ impl FreeList {
         let prev = unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.swap(outstanding, Ordering::Release);
         let diff = usize::MAX - prev;
         if diff > 0 {
-            // println!("racing diff {}", diff);
+            println!("racing diff {}", diff);
             if unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.fetch_sub(diff, Ordering::AcqRel) == diff {
                 // free the memory again
                 let _ = unsafe { Box::from_raw(outstanding_shared) };
@@ -165,7 +165,7 @@ impl FreeList {
                 // initialize a new ThreadGuard.
                 THREAD_ID_MANAGER.lock().unwrap().free(id);
             }
-            // println!("no diff!");
+            println!("no diff!");
         }
     }
 }

@@ -333,7 +333,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
 
     /// SAFETY: This may only be called after the thread associated with this thread local has finished.
     unsafe fn free_id(&self) {
-        // println!("free_id call {}", self.id);
+        println!("free_id call {}", self.id);
         // signal that there is no more manual cleanup required for future threads that get assigned this
         // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
         // even though the entry is completely unused.
@@ -346,11 +346,11 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
                 return;
             }
             mem::forget(outstanding);
-            // println!("free mem!");
+            println!("free mem!");
             // free the memory again
             let _ = Box::from_raw(outstanding_ptr);
         }
-        // println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
+        println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
         // the tid_manager is either an `alternative` id manager or the `global` tid manager.
         unsafe { self.tid_manager.as_ref() }.lock().unwrap().free(self.id);
     }
@@ -553,7 +553,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             return val;
         }
 
-        // println!("failed fetching entry of: {}", thread.id);
+        println!("failed fetching entry of: {}", thread.id);
         self.insert(create, meta)
     }
 
@@ -619,7 +619,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
 
         // check if the entry isn't cleaned up automatically
         if entry.guard.load(Ordering::Acquire) == GUARD_FREE_MANUALLY {
-            // println!("to be freed entry: freelist {:?} id {} tid_manager: {:?}", entry.free_list.load(Ordering::Acquire), entry.id, entry.tid_manager);
+            println!("to be freed entry: freelist {:?} id {} tid_manager: {:?}", entry.free_list.load(Ordering::Acquire), entry.id, entry.tid_manager);
             // traverse alternative entries recursively until we find the end and can insert our new entry
             while let Some(alt) = unsafe { entry.alternative_entry.load(Ordering::Acquire).as_ref() } {
                 entry = alt;
@@ -627,7 +627,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
             let alt = self.acquire_alternative_entry();
             entry.alternative_entry.store(alt.cast_mut(), Ordering::Release);
             entry = unsafe { &*alt };
-            // println!("acquired alternative entry: {:?} (master entry: {:?})", alt, entry_ptr);
+            println!("acquired alternative entry: {:?} (master entry: {:?})", alt, entry_ptr);
         }
 
         let value_ptr = entry.value.get();
@@ -686,7 +686,7 @@ impl<T: Send, M: Metadata, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FRE
         };
 
         let ret = unsafe { bucket_ptr.add(index) };
-        // println!("alt cache {:?} with id {}", ret, id);
+        println!("alt cache {:?} with id {}", ret, id);
         ret
     }
 
@@ -1070,7 +1070,7 @@ fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Met
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
                 tid_manager,
                 id: {
-                    // println!("calced id: {}[{}]: {}", bucket, n, ((1 << bucket) >> 1) + n);
+                    println!("calced id: {}[{}]: {}", bucket, n, ((1 << bucket) >> 1) + n);
                     // special case the first bucket as the first two buckets both only have a single entry (that's why the sub has to be saturating).
                     // we need to offset all entries by the number of all entries of previous buckets.
                     ((1 << bucket) >> 1) + n
@@ -1250,7 +1250,7 @@ mod tests {
         let mut v = tls
             .iter()
             .map(|x| {
-                // println!("found: {}", x.value());
+                println!("found: {}", x.value());
                 **x.value()
             })
             .collect::<Vec<i32>>();

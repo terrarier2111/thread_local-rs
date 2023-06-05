@@ -141,6 +141,8 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> UnsafeToken<T, M, A
 
     /// This is `MaybeUninit<T>` instead of `T` because when `UnsafeToken` is handed out
     /// in the first closure of`get_or` the value is still uninitialized.
+    /// Furthermore this token may outlive the Entry it corresponds to and as
+    /// such any access to the Entry is inherently unsafe.
     #[inline]
     pub unsafe fn value_ptr(&self) -> *const MaybeUninit<T> {
         unsafe { &*self.0.as_ref().value.get() as *const MaybeUninit<T> }
@@ -148,16 +150,22 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> UnsafeToken<T, M, A
 
     /// This is `MaybeUninit<T>` instead of `T` because when `UnsafeToken` is handed out
     /// in the first closure of`get_or` the value is still uninitialized.
+    /// Furthermore this token may outlive the Entry it corresponds to and as
+    /// such any access to the Entry is inherently unsafe.
     #[inline]
     pub unsafe fn value(&self) -> &MaybeUninit<T> {
         unsafe { &&*self.0.as_ref().value.get() }
     }
 
+    /// This token may outlive the Entry it corresponds to and as
+    /// such any access to the Entry is inherently unsafe.
     #[inline]
     pub unsafe fn meta_ptr(&self) -> *const M {
         self.meta() as *const M
     }
 
+    /// This token may outlive the Entry it corresponds to and as
+    /// such any access to the Entry is inherently unsafe.
     #[inline]
     pub unsafe fn meta(&self) -> &M {
         unsafe { &self.0.as_ref().meta }
@@ -172,7 +180,8 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> UnsafeToken<T, M, A
 
 impl<T, M: Send + Sync + Default> UnsafeToken<T, M, false> {
 
-    /// SAFETY: This may only be called after the thread associated with this thread local has finished.
+    /// SAFETY: This may only be called after the thread associated with this thread local got terminated
+    /// or inside the destructor of the value contained within the Entry.
     pub unsafe fn destruct(self) {
         unsafe { self.0.as_ref().free_id(); }
     }
@@ -195,7 +204,7 @@ impl<'a, ACCESS, T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> EntryTo
     }
 
     #[inline]
-    pub unsafe fn into_unsafe_token(self) -> UnsafeToken<T, M, AUTO_FREE_IDS> {
+    pub fn into_unsafe_token(self) -> UnsafeToken<T, M, AUTO_FREE_IDS> {
         UnsafeToken(self.0)
     }
 
@@ -203,7 +212,8 @@ impl<'a, ACCESS, T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> EntryTo
 
 impl<'a, ACCESS, T, M: Send + Sync + Default> EntryToken<'a, ACCESS, T, M, false> {
 
-    /// SAFETY: This may only be called after the thread associated with this thread local has finished.
+    /// SAFETY: This may only be called after the thread associated with this thread local got terminated
+    /// or inside the destructor of the value contained within the Entry.
     pub unsafe fn destruct(self) {
         unsafe { self.0.as_ref().free_id(); }
     }
@@ -317,9 +327,6 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
 
     /// This will get called when the thread associated with this entry exits.
     pub(crate) unsafe fn cleanup(slf: *const Entry<()>, remaining_cnt: *const AtomicUsize) -> bool {
-        // FIXME: there is a bug in this function when the destructor of T calls destruct on
-        // FIXME: this entry's token, then the guard gets set to EMPTY before this guard's store
-        // FIXME: gets performed which leads to an unexpected guard value.
         let slf = unsafe { &*slf.cast::<Entry<T, M, AUTO_FREE_IDS>>() };
         let backoff = Backoff::new();
         while slf

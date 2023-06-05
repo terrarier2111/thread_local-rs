@@ -340,7 +340,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
         self.guard.store(GUARD_EMPTY, Ordering::Release);
         // check if we are a "main" entry and our thread is finished
         let outstanding = self.outstanding_refs.load(Ordering::Acquire);
-        if let Some(outstanding) = unsafe { outstanding.as_ref() } {
+        if let Some(outstanding) = unsafe { outstanding.as_ref() } { // FIXME: this as_ref call leads to a use-after-free
             if outstanding.fetch_sub(1, Ordering::AcqRel) != 1 {
                 // there are outstanding references left, so we can't free the id yet.
                 return;

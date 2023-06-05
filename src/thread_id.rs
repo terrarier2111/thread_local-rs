@@ -130,7 +130,7 @@ impl FreeList {
         let mut outstanding = 0;
         for entry in free_list.unwrap().iter() {
             // sum up all the "failed" cleanups
-            if unsafe { !entry.1.cleanup(*entry.0 as *const Entry<()>, &outstanding_shared as *const Box<AtomicUsize> as *const AtomicUsize) } {
+            if unsafe { !entry.1.cleanup(*entry.0 as *const Entry<()>, outstanding_shared.deref() as *const AtomicUsize) } {
                 outstanding += 1;
             }
         }

@@ -368,48 +368,49 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
             return false;
         }
 
-        Self::force_free_id(slf);
-        false
-    }
-
-    /// SAFETY: This may only be called after the thread associated with this thread local has finished.
-    unsafe fn free_id(&self) {
-        if self.guard.load(Ordering::Acquire) != GUARD_ACTIVE_EXTERNAL {
-            Self::force_free_id(self);
-            return;
-        }
-        self.guard.store(GUARD_ACTIVE_EXTERNAL | GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG, Ordering::Release);
-    }
-
-    unsafe fn force_free_id(slf: &Entry<T, M, AUTO_FREE_IDS>) {
-        println!("free_id call {}", slf.id);
-        // check if we are a "main" entry and our thread is finished
-        let outstanding_ptr = slf.outstanding_refs.load(Ordering::Acquire);
-        if let Some(outstanding) = unsafe { outstanding_ptr.as_ref() } {
-            if outstanding.fetch_sub(1, Ordering::AcqRel) != 1 {
-                // there are outstanding references left, so we can't free the id yet.
-
-                // signal that there is no more manual cleanup required for future threads that get assigned this
-                // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
-                // even though the entry is completely unused.
-                slf.guard.store(GUARD_EMPTY, Ordering::Release);
-                return;
-            }
-            mem::forget(outstanding);
-            println!("free mem!");
-            // free the memory again
-            let _ = Box::from_raw(outstanding_ptr);
-        } else {
-            panic!("no outstanding refs!");
-        }
-        println!("freeeeeeeing {} in {:?} glob {:?}", slf.id, slf.tid_manager, global_tid_manager());
         // signal that there is no more manual cleanup required for future threads that get assigned this
         // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
         // even though the entry is completely unused.
         slf.guard.store(GUARD_EMPTY, Ordering::Release);
 
-        // the tid_manager is either an `alternative` id manager or the `global` tid manager.
-        unsafe { slf.tid_manager.as_ref() }.lock().unwrap().free(slf.id);
+        // just pretend like we are auto-cleaned up because we already received the manual cleanup request.
+        true
+    }
+
+    /// SAFETY: This may only be called after the thread associated with this thread local has finished.
+    unsafe fn free_id(&self) {
+        if self.guard.load(Ordering::Acquire) != GUARD_ACTIVE_EXTERNAL {
+            println!("free_id call {}", self.id);
+            // check if we are a "main" entry and our thread is finished
+            let outstanding_ptr = self.outstanding_refs.load(Ordering::Acquire);
+            if let Some(outstanding) = unsafe { outstanding_ptr.as_ref() } { // FIXME: we should be able to unwrap this unchecked, as it should never be null
+                if outstanding.fetch_sub(1, Ordering::AcqRel) != 1 {
+                    // there are outstanding references left, so we can't free the id yet.
+
+                    // signal that there is no more manual cleanup required for future threads that get assigned this
+                    // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
+                    // even though the entry is completely unused.
+                    self.guard.store(GUARD_EMPTY, Ordering::Release);
+                    return;
+                }
+                mem::forget(outstanding);
+                println!("free mem!");
+                // free the memory again
+                let _ = Box::from_raw(outstanding_ptr);
+            } else {
+                panic!("no outstanding refs!");
+            }
+            println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
+            // signal that there is no more manual cleanup required for future threads that get assigned this
+            // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
+            // even though the entry is completely unused.
+            self.guard.store(GUARD_EMPTY, Ordering::Release);
+
+            // the tid_manager is either an `alternative` id manager or the `global` tid manager.
+            unsafe { self.tid_manager.as_ref() }.lock().unwrap().free(self.id);
+            return;
+        }
+        self.guard.store(GUARD_ACTIVE_EXTERNAL | GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG, Ordering::Release);
     }
 
 }

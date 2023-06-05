@@ -5,14 +5,17 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use std::alloc::{alloc, alloc_zeroed, dealloc, Layout};
 use std::cell::Cell;
 use crate::{BUCKETS, Entry, POINTER_WIDTH};
 use once_cell::sync::Lazy;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::mem;
+use std::mem::transmute;
 use std::ops::Deref;
 use std::ptr::{NonNull, null};
 
@@ -22,32 +25,55 @@ use std::ptr::{NonNull, null};
 pub(crate) struct ThreadIdManager {
     free_from: usize,
     free_list: BinaryHeap<Reverse<usize>>,
+    limbo_list: Vec<usize>,
 }
 
 impl ThreadIdManager {
-    pub fn new() -> Self {
+    fn new() -> Self {
+        SHARED_IDS[0].set(alloc_shared(1));
         Self {
             free_from: 0,
             free_list: BinaryHeap::new(),
+            limbo_list: vec![],
         }
     }
 
     pub(crate) fn alloc(&mut self) -> usize {
-        let ret = if let Some(id) = self.free_list.pop() {
-            id.0
-        } else {
-            // we don't allow 1 before MAX to be returned because our buckets can only contain
-            // up to usize::MAX - 1 elements, but this shouldn't have any impact in practice.
-            if self.free_from >= usize::MAX - 1 {
-                panic!("Ran out of thread IDs");
+        if let Some(id) = self.free_list.pop() {
+            println!("alloced tid: {}", id.0);
+            return id.0;
+        }
+
+        if !self.limbo_list.is_empty() {
+            let id = self.limbo_list.remove(0);
+            let (bucket, _, index) = id_into_parts(id);
+            let counter = unsafe { SHARED_IDS[bucket].get().offset(index as isize).as_ref().unwrap_unchecked() };
+            // check if there are outstanding entries using the limboed id
+            if counter.load(Ordering::Acquire) == 0 {
+                // yay! there are no more outstanding entries!
+                return id;
             }
 
-            let id = self.free_from;
-            self.free_from += 1;
-            id
-        };
-        println!("alloced tid: {}", ret);
-        ret
+            self.limbo_list.push(id);
+        }
+
+        // we don't allow 1 before MAX to be returned because our buckets can only contain
+        // up to usize::MAX - 1 elements, but this shouldn't have any impact in practice.
+        if self.free_from >= usize::MAX - 1 {
+            panic!("Ran out of thread IDs");
+        }
+
+        let id = self.free_from;
+        self.free_from += 1;
+
+        if id % 2 == 0 {
+            let bucket = POINTER_WIDTH as usize - id.leading_zeros() as usize + 1;
+            let bucket_size = 1 << bucket;
+            SHARED_IDS[bucket].set(alloc_shared(bucket_size));
+        }
+
+        println!("alloced tid: {}", id);
+        id
     }
 
     pub(crate) fn free(&mut self, id: usize) {
@@ -60,10 +86,75 @@ impl ThreadIdManager {
 
         self.free_list.push(Reverse(id));
     }
+
+    pub(crate) fn free_limbo(&mut self, id: usize) {
+        if self.free_list.iter().find(|x| x.0 == id).is_some() {
+            panic!("double freed tid!");
+        }
+        if self.free_from <= id {
+            panic!("freed tid although tid was never handed out {} max {} glob {:?} local {:?}", id, self.free_from, global_tid_manager(), self as *const ThreadIdManager);
+        }
+
+        self.limbo_list.push(id);
+    }
+
+}
+
+impl Drop for ThreadIdManager {
+    fn drop(&mut self) {
+        let buckets = POINTER_WIDTH as usize - self.free_from.next_power_of_two().leading_zeros() as usize + 1;
+        for bucket in 0..buckets {
+            let ptr = SHARED_IDS[bucket].get().cast_mut();
+            unsafe { dealloc(ptr.cast(), Layout::array::<AtomicUsize>(1 << bucket).unwrap_unchecked()); }
+        }
+        println!("dealloced!");
+    }
+}
+
+fn alloc_shared(size: usize) -> *const AtomicUsize {
+    let ret = unsafe { alloc_zeroed(Layout::array::<AtomicUsize>(size).unwrap()) };
+    if ret.is_null() {
+        panic!("There was an error allocating shared counters!");
+    }
+    ret.cast::<AtomicUsize>().cast_const()
 }
 
 static THREAD_ID_MANAGER: Lazy<Mutex<ThreadIdManager>> =
     Lazy::new(|| Mutex::new(ThreadIdManager::new()));
+
+pub(crate) static SHARED_IDS: [PtrCell<AtomicUsize>; BUCKETS] = {
+    unsafe { transmute([null::<AtomicUsize>(); BUCKETS]) }
+};
+
+pub(crate) unsafe fn shared_id_ptr(id: usize) -> *const AtomicUsize {
+    let (bucket, _, index) = id_into_parts(id);
+    SHARED_IDS[bucket].get().offset(index as isize)
+}
+
+#[derive(Clone)]
+pub(crate) struct PtrCell<T>(Cell<usize>, PhantomData<T>);
+
+impl<T> PtrCell<T> {
+
+    #[inline]
+    pub(crate) fn new(val: *const T) -> Self {
+        Self(Cell::new(val as usize), PhantomData)
+    }
+
+    #[inline]
+    pub(crate) fn set(&self, val: *const T) {
+        self.0.set(val as usize);
+    }
+
+    #[inline]
+    pub(crate) fn get(&self) -> *const T {
+        self.0.get() as *const T
+    }
+
+}
+
+unsafe impl<T: Send> Send for PtrCell<T> {}
+unsafe impl<T: Sync> Sync for PtrCell<T> {}
 
 /// Data which is unique to the current thread while it is running.
 /// A thread ID may be reused after a thread exits.
@@ -115,13 +206,15 @@ pub(crate) fn global_tid_manager() -> NonNull<Mutex<ThreadIdManager>> {
 }
 
 pub(crate) struct FreeList {
+    id: usize,
     pub(crate) dropping: AtomicBool,
     pub(crate) free_list: Mutex<HashMap<usize, EntryData>>,
 }
 
 impl FreeList {
-    fn new() -> Self {
+    fn new(id: usize) -> Self {
         Self {
+            id,
             dropping: Default::default(),
             free_list: Mutex::new(Default::default()),
         }
@@ -131,7 +224,8 @@ impl FreeList {
         self.dropping.store(true, Ordering::Release);
         let free_list = self.free_list.lock();
         println!("alloced shared counter!");
-        let outstanding_shared = Box::into_raw(Box::new(AtomicUsize::new(usize::MAX)));
+        let outstanding_shared = unsafe { shared_id_ptr(self.id) };
+        unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.store(usize::MAX, Ordering::Release);
         let mut outstanding = 0;
         for entry in free_list.unwrap().iter() {
             // sum up all the "failed" cleanups
@@ -140,36 +234,33 @@ impl FreeList {
             }
         }
 
-        // store the actual number of outstanding references and ensure that all
-        // updates that happened before are applied to the actual value after
-        // the initial store and cleanup the id if there are no actual outstanding
-        // references left after syncing the references.
-        let prev = unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.swap(outstanding, Ordering::Release);
-        let diff = usize::MAX - prev;
-        if diff > 0 {
-            println!("racing diff {}", diff);
-            if unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.fetch_sub(diff, Ordering::AcqRel) == diff {
-                // free the memory again
-                let _ = unsafe { Box::from_raw(outstanding_shared) };
-                // perform the actual cleanup of the id
-                let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
-                // Release the thread ID. Any further accesses to the thread ID
-                // will go through get_slow which will either panic or
-                // initialize a new ThreadGuard.
-                THREAD_ID_MANAGER.lock().unwrap().free(id);
+        if outstanding > 0 {
+            // store the actual number of outstanding references and ensure that all
+            // updates that happened before are applied to the actual value after
+            // the initial store and cleanup the id if there are no actual outstanding
+            // references left after syncing the references.
+            let prev = unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.swap(outstanding, Ordering::Release);
+            let diff = usize::MAX - prev;
+            if diff > 0 {
+                println!("racing diff {}", diff);
+                if unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.fetch_sub(diff, Ordering::AcqRel) == diff {
+                    // perform the actual cleanup of the id
+                    let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
+                    // Release the thread ID. Any further accesses to the thread ID
+                    // will go through get_slow which will either panic or
+                    // initialize a new ThreadGuard.
+                    THREAD_ID_MANAGER.lock().unwrap().free(id);
+                }
+            } else {
+                println!("no diff!");
             }
         } else {
-            if outstanding == 0 {
-                // free the memory again
-                let _ = unsafe { Box::from_raw(outstanding_shared) };
-                // perform the actual cleanup of the id
-                let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
-                // Release the thread ID. Any further accesses to the thread ID
-                // will go through get_slow which will either panic or
-                // initialize a new ThreadGuard.
-                THREAD_ID_MANAGER.lock().unwrap().free(id);
-            }
-            println!("no diff!");
+            // perform the actual cleanup of the id
+            let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
+            // Release the thread ID. Any further accesses to the thread ID
+            // will go through get_slow which will either panic or
+            // initialize a new ThreadGuard.
+            THREAD_ID_MANAGER.lock().unwrap().free(id);
         }
     }
 }
@@ -223,10 +314,11 @@ pub(crate) fn get() -> Thread {
 /// Out-of-line slow path for allocating a thread ID.
 #[cold]
 fn get_slow() -> Thread {
+    let tid = THREAD_ID_MANAGER.lock().unwrap().alloc();
     unsafe {
-        FREE_LIST = Some(FreeList::new());
+        FREE_LIST = Some(FreeList::new(tid));
     }
-    let new = Thread::new(THREAD_ID_MANAGER.lock().unwrap().alloc(), unsafe {
+    let new = Thread::new(tid, unsafe {
         FREE_LIST.as_ref().unwrap_unchecked() as *const FreeList
     });
     unsafe {

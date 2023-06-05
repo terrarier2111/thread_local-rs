@@ -74,7 +74,7 @@ mod thread_id;
 mod unreachable;
 
 use std::alloc::{alloc, dealloc, Layout};
-use crate::thread_id::{EntryData, FreeList, global_tid_manager, Thread, ThreadIdManager};
+use crate::thread_id::{EntryData, FreeList, global_tid_manager, shared_id_ptr, Thread, ThreadIdManager};
 use crossbeam_utils::Backoff;
 use smallvec::{smallvec, SmallVec};
 use std::cell::UnsafeCell;
@@ -99,18 +99,19 @@ const POINTER_WIDTH: u8 = 32;
 const POINTER_WIDTH: u8 = 64;
 
 /// The total number of buckets stored in each thread local.
-const BUCKETS: usize = (POINTER_WIDTH - 1) as usize;
+/// We subtract the number of powers of two that the size of
+/// a word make in difference because every bucket we will ever
+/// use will at least be word-sized.
+const BUCKETS: usize = (POINTER_WIDTH - (POINTER_WIDTH - POINTER_SIZE_BYTES.leading_zeros() as u8)) as usize;
+const POINTER_SIZE_BYTES: u8 = POINTER_WIDTH / 8;
 
 /// Thread-local variable wrapper
 ///
 /// See the [module-level documentation](index.html) for more.
 pub struct ThreadLocal<T: Send, M: Send + Sync + Default = (), const AUTO_FREE_IDS: bool = true> {
-    /// The buckets in the thread local. The nth bucket contains `2^(n-1)`
+    /// The buckets in the thread local. The nth bucket contains `2^n`
     /// elements. Each bucket is lazily allocated.
     buckets: [AtomicPtr<Entry<T, M, AUTO_FREE_IDS>>; BUCKETS],
-
-    alternative_buckets: [AtomicPtr<Entry<T, M, AUTO_FREE_IDS>>; BUCKETS],
-    alternative_entry_ids: SizedBox<Mutex<ThreadIdManager>>,
 }
 
 const GUARD_UNINIT: usize = 0;
@@ -247,9 +248,7 @@ struct Entry<T, M: Send + Sync + Default = (), const AUTO_FREE_IDS: bool = true>
     tid_manager: NonNull<Mutex<ThreadIdManager>>,
     id: usize,
     guard: AtomicUsize,
-    alternative_entry: AtomicPtr<Entry<T, M, AUTO_FREE_IDS>>,
     free_list: AtomicPtr<FreeList>,
-    outstanding_refs: AtomicPtr<AtomicUsize>,
     meta: M,
     value: UnsafeCell<MaybeUninit<T>>,
 }
@@ -261,21 +260,6 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
         &self,
         cleanup: &mut SmallVec<[*const Entry<T, M, AUTO_FREE_IDS>; N]>,
     ) {
-        let mut alt = self.alternative_entry.load(Ordering::Acquire);
-
-        while let Some(alt_ref) = alt.as_ref() {
-            // when its freelist is non-null, we know that the entry is active
-            if !alt_ref.free_list.load(Ordering::Acquire).is_null() {
-                break;
-            }
-
-            if !alt_ref.try_detach_thread_locally() {
-                cleanup.push(alt.cast_const());
-            }
-
-            alt = alt_ref.alternative_entry.load(Ordering::Acquire);
-        }
-
         if !self.try_detach_thread_locally() {
             cleanup.push(self as *const _);
         }
@@ -347,10 +331,6 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
             ptr::drop_in_place(val);
         }
 
-        if !AUTO_FREE_IDS {
-            slf.outstanding_refs.store(remaining_cnt.cast_mut(), Ordering::Release);
-        }
-
         // signal that there is no thread associated with the entry anymore.
         // this also disables the cleanup of this entry in the `normal` entry
         // on destruction of the central struct.
@@ -382,7 +362,7 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
         if self.guard.load(Ordering::Acquire) != GUARD_ACTIVE_EXTERNAL {
             println!("free_id call {}", self.id);
             // check if we are a "main" entry and our thread is finished
-            let outstanding_ptr = self.outstanding_refs.load(Ordering::Acquire);
+            let outstanding_ptr = shared_id_ptr(self.id);
             if let Some(outstanding) = unsafe { outstanding_ptr.as_ref() } { // FIXME: we should be able to unwrap this unchecked, as it should never be null
                 if outstanding.fetch_sub(1, Ordering::AcqRel) != 1 {
                     // there are outstanding references left, so we can't free the id yet.
@@ -393,10 +373,6 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
                     self.guard.store(GUARD_EMPTY, Ordering::Release);
                     return;
                 }
-                mem::forget(outstanding);
-                println!("free mem!");
-                // free the memory again
-                let _ = Box::from_raw(outstanding_ptr);
             } else {
                 panic!("no outstanding refs!");
             }
@@ -474,52 +450,8 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Thre
 
         bucket_size = 1;
 
-        // free alternative buckets
-        for bucket in self.alternative_buckets.iter() {
-            let bucket_ptr = bucket.load(Ordering::Relaxed);
-
-            let this_bucket_size = bucket_size;
-            bucket_size <<= 1;
-
-            if bucket_ptr.is_null() {
-                // we went up high enough to find an empty bucket, we now know that
-                // there are no more non-empty buckets.
-                break;
-            }
-
-            // FIXME: do we even need to check these alternative buckets - as we should already have awaited
-            // FIXME: all of them while awaiting the "normal" buckets.
-            for offset in 0..this_bucket_size {
-                let entry = unsafe { bucket_ptr.add(offset).as_ref().unwrap_unchecked() };
-                let backoff = Backoff::new();
-                while is_active_external::<AUTO_FREE_IDS>(entry.guard.load(Ordering::Acquire)) {
-                    backoff.snooze();
-                }
-            }
-        }
-
-        bucket_size = 1;
-
         // Free each non-null bucket
         for bucket in self.buckets.iter_mut() {
-            let bucket_ptr = *bucket.get_mut();
-
-            let this_bucket_size = bucket_size;
-            bucket_size <<= 1;
-
-            if bucket_ptr.is_null() {
-                // we went up high enough to find an empty bucket, we now know that
-                // there are no more non-empty buckets.
-                break;
-            }
-
-            unsafe { deallocate_bucket(bucket_ptr, this_bucket_size) };
-        }
-
-        bucket_size = 1;
-
-        // free alternative buckets
-        for bucket in self.alternative_buckets.iter_mut() {
             let bucket_ptr = *bucket.get_mut();
 
             let this_bucket_size = bucket_size;
@@ -557,26 +489,10 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
             bucket_size <<= 1;
         }
 
-        let tid_manager = SizedBox::new(Mutex::new(ThreadIdManager::new()));
-
-        let mut alternative_buckets = [null_mut(); BUCKETS];
-        let mut bucket_size = 1;
-        for (i, bucket) in alternative_buckets[..allocated_buckets]
-            .iter_mut()
-            .enumerate()
-        {
-            let tid_manager = unsafe { NonNull::new_unchecked((tid_manager.as_ref() as *const Mutex<ThreadIdManager>).cast_mut()) };
-            *bucket = allocate_bucket::<true, AUTO_FREE_IDS, T, M>(bucket_size, tid_manager, i);
-
-            bucket_size <<= 1;
-        }
-
         Self {
             // Safety: AtomicPtr has the same representation as a pointer and arrays have the same
             // representation as a sequence of their inner type.
             buckets: unsafe { transmute(buckets) },
-            alternative_buckets: unsafe { transmute(alternative_buckets) },
-            alternative_entry_ids: tid_manager,
         }
     }
 
@@ -611,18 +527,8 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         let mut entry = unsafe { &*entry_ptr };
         let mut free_list = entry.free_list.load(Ordering::Acquire);
 
-        // check if the entry is unusable (it does not have an init value and it's not a pseudo-present value)
-        while free_list.cast_const() != thread.free_list {
-            let alt_ptr = entry.alternative_entry.load(Ordering::Acquire);
-
-            // check if there is an alternative entry present
-            if alt_ptr.is_null() {
-                return None;
-            }
-
-            entry_ptr = alt_ptr;
-            entry = unsafe { &*entry_ptr };
-            free_list = entry.free_list.load(Ordering::Acquire);
+        if free_list.is_null() {
+            return None;
         }
 
         Some(EntryToken(unsafe { NonNull::new_unchecked(entry_ptr) }, Default::default()))
@@ -664,14 +570,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         // check if the entry isn't cleaned up automatically
         if entry.guard.load(Ordering::Acquire) == GUARD_FREE_MANUALLY {
             println!("to be freed entry: freelist {:?} id {} tid_manager: {:?}", entry.free_list.load(Ordering::Acquire), entry.id, entry.tid_manager);
-            // traverse alternative entries recursively until we find the end and can insert our new entry
-            while let Some(alt) = unsafe { entry.alternative_entry.load(Ordering::Acquire).as_ref() } {
-                entry = alt;
-            }
-            let alt = self.acquire_alternative_entry();
-            entry.alternative_entry.store(alt.cast_mut(), Ordering::Release);
-            entry = unsafe { &*alt };
-            println!("acquired alternative entry: {:?} (master entry: {:?})", alt, entry_ptr);
+            panic!("found entry which should have been manually freed!");
         }
 
         let value_ptr = entry.value.get();
@@ -696,42 +595,6 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         entry.guard.store(GUARD_READY, Ordering::Release);
 
         EntryToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default())
-    }
-
-    fn acquire_alternative_entry(&self) -> *const Entry<T, M, AUTO_FREE_IDS> {
-        let id = self.alternative_entry_ids.as_ref().lock().unwrap().alloc();
-        let (bucket, bucket_size, index) = thread_id::id_into_parts(id);
-
-        let bucket_atomic_ptr = unsafe { self.alternative_buckets.get_unchecked(bucket) };
-        let bucket_ptr: *const _ = bucket_atomic_ptr.load(Ordering::Acquire);
-
-        // If the bucket doesn't already exist, we need to allocate it
-        let bucket_ptr = if bucket_ptr.is_null() {
-            let tid_manager = unsafe { NonNull::new_unchecked((self.alternative_entry_ids.as_ref() as *const Mutex<ThreadIdManager>).cast_mut()) };
-            let new_bucket = allocate_bucket::<true, AUTO_FREE_IDS, T, M>(bucket_size, tid_manager, bucket);
-
-            match bucket_atomic_ptr.compare_exchange(
-                null_mut(),
-                new_bucket,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => new_bucket,
-                // If the bucket value changed (from null), that means
-                // another thread stored a new bucket before we could,
-                // and we can free our bucket and use that one instead
-                Err(bucket_ptr) => {
-                    unsafe { deallocate_bucket(new_bucket, bucket_size) }
-                    bucket_ptr
-                }
-            }
-        } else {
-            bucket_ptr
-        };
-
-        let ret = unsafe { bucket_ptr.add(index) };
-        println!("alt cache {:?} with id {}", ret, id);
-        ret
     }
 
     /// Returns an iterator over the local values of all threads in unspecified
@@ -945,38 +808,6 @@ impl<'a, T: Send + Sync, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> It
         if let Some(prev) = unsafe { self.prev.as_ref() } {
             // mark the previous entry as `READY` again as we are done using it at this point.
             prev.guard.store(GUARD_READY, Ordering::Release);
-            let alt_ptr = prev.alternative_entry.load(Ordering::Acquire);
-            if let Some(alt) = unsafe { alt_ptr.as_ref() } {
-                let backoff = Backoff::new();
-                // this loop will only ever loop multiple times if the guard of the current entry
-                // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
-                // we have to wait on another iterator to use it.
-                loop {
-                    match alt.guard.compare_exchange(
-                        GUARD_READY,
-                        GUARD_ACTIVE_ITERATOR,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => {
-                            return Some(EntryToken(unsafe { NonNull::new_unchecked(alt_ptr) }, Default::default()));
-                        }
-                        Err(guard) => {
-                            if guard == GUARD_UNINIT {
-                                return None;
-                            }
-                            if guard != GUARD_ACTIVE_ITERATOR {
-                                break;
-                            }
-                            backoff.snooze();
-                        }
-                    }
-                }
-
-                self.prev = alt as *const _;
-
-                return Some(EntryToken(unsafe { NonNull::new_unchecked(alt_ptr) }, Default::default()));
-            }
         }
 
         self.raw.next(self.thread_local).map(|entry| {
@@ -1011,38 +842,6 @@ impl<'a, T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator 
         if let Some(prev) = unsafe { self.prev.as_ref() } {
             // mark the previous entry as `READY` again as we are done using it at this point.
             prev.guard.store(GUARD_READY, Ordering::Release);
-            let alt_ptr = prev.alternative_entry.load(Ordering::Acquire);
-            if let Some(alt) = unsafe { alt_ptr.as_ref() } {
-                let backoff = Backoff::new();
-                // this loop will only ever loop multiple times if the guard of the current entry
-                // is `GUARD_ACTIVE_ITERATOR`. We have to loop here as the entry is still valid but
-                // we have to wait on another iterator to use it.
-                loop {
-                    match alt.guard.compare_exchange(
-                        GUARD_READY,
-                        GUARD_ACTIVE_ITERATOR,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => {
-                            return Some(EntryToken(unsafe { NonNull::new_unchecked(alt_ptr) }, Default::default()));
-                        }
-                        Err(guard) => {
-                            if guard == GUARD_UNINIT {
-                                return None;
-                            }
-                            if guard != GUARD_ACTIVE_ITERATOR {
-                                break;
-                            }
-                            backoff.snooze();
-                        }
-                    }
-                }
-
-                self.prev = alt as *const _;
-
-                return Some(EntryToken(unsafe { NonNull::new_unchecked(alt_ptr) }, Default::default()));
-            }
         }
 
         self.raw.next_mut(self.thread_local).map(|entry| {
@@ -1113,14 +912,11 @@ fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Sen
                 tid_manager,
                 id: {
                     println!("calced id: {}[{}]: {}", bucket, n, (1 << bucket) - 1 + n);
-                    // special case the first bucket as the first two buckets both only have a single entry (that's why the sub has to be saturating).
                     // we need to offset all entries by the number of all entries of previous buckets.
                     (1 << bucket) - 1 + n
                 },
                 guard: AtomicUsize::new(GUARD_UNINIT),
-                alternative_entry: AtomicPtr::new(null_mut()),
                 free_list: Default::default(),
-                outstanding_refs: Default::default(),
                 meta: Default::default(),
                 value: UnsafeCell::new(MaybeUninit::uninit()),
             })

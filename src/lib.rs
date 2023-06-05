@@ -123,6 +123,16 @@ const GUARD_ACTIVE_INTERNAL: usize = 3;
 const GUARD_ACTIVE_EXTERNAL: usize = 4;
 const GUARD_ACTIVE_ITERATOR: usize = 5;
 const GUARD_FREE_MANUALLY: usize = 6; // FIXME: if we store this once, when are we able to reuse the entry again?
+const GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG: usize = 1 << (usize::BITS - 1);
+
+#[inline]
+fn is_active_external<const AUTO_FREE_IDS: bool>(guard: usize) -> bool {
+    if AUTO_FREE_IDS {
+        guard == GUARD_ACTIVE_EXTERNAL
+    } else {
+        (guard & !GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG) == GUARD_ACTIVE_EXTERNAL
+    }
+}
 
 #[derive(Clone)]
 pub struct UnsafeToken<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>(NonNull<Entry<T, M, AUTO_FREE_IDS>>);
@@ -266,7 +276,7 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
         let guard = self.guard.load(Ordering::Acquire);
         // the entry is either empty or the guard is currently active
         if guard != GUARD_READY {
-            return guard != GUARD_ACTIVE_EXTERNAL;
+            return !is_active_external::<AUTO_FREE_IDS>(guard);
         }
         // the entry is `Ready`, so we know that we can get exclusive access to it
         if let Err(val) = self.guard.compare_exchange(
@@ -275,7 +285,7 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
             Ordering::AcqRel,
             Ordering::Relaxed,
         ) {
-            return val != GUARD_ACTIVE_EXTERNAL;
+            return !is_active_external::<AUTO_FREE_IDS>(val);
         }
 
         self.remove_from_freelist()
@@ -339,32 +349,60 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
         // on destruction of the central struct.
         slf.free_list.store(null_mut(), Ordering::Release);
         println!("set free manually id {} addr {:?}", slf.id, slf as *const Entry<T, M, AUTO_FREE_IDS>);
-        slf.guard.store(if AUTO_FREE_IDS { GUARD_EMPTY } else { GUARD_FREE_MANUALLY }, Ordering::Release); // FIXME: is it okay to store GUARD_EMPTY even if there is still an alternative_entry present?
-        AUTO_FREE_IDS
+
+        if AUTO_FREE_IDS {
+            slf.guard.store(GUARD_EMPTY, Ordering::Release); // FIXME: is it okay to store GUARD_EMPTY even if there is still an alternative_entry present?
+            return true;
+        }
+
+        // check if the destructor of the value destructed this entry, if not, simply return
+        if (slf.guard.load(Ordering::Acquire) & GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG) == 0 {
+            slf.guard.store(GUARD_FREE_MANUALLY, Ordering::Release); // FIXME: is it okay to store GUARD_EMPTY even if there is still an alternative_entry present?
+            return false;
+        }
+
+        Self::force_free_id(slf);
+        false
     }
 
     /// SAFETY: This may only be called after the thread associated with this thread local has finished.
     unsafe fn free_id(&self) {
-        println!("free_id call {}", self.id);
-        // signal that there is no more manual cleanup required for future threads that get assigned this
-        // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
-        // even though the entry is completely unused.
-        self.guard.store(GUARD_EMPTY, Ordering::Release);
+        if self.guard.load(Ordering::Acquire) != GUARD_ACTIVE_EXTERNAL {
+            Self::force_free_id(self);
+            return;
+        }
+        self.guard.store(GUARD_ACTIVE_EXTERNAL | GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG, Ordering::Release);
+    }
+
+    unsafe fn force_free_id(slf: &Entry<T, M, AUTO_FREE_IDS>) {
+        println!("free_id call {}", slf.id);
         // check if we are a "main" entry and our thread is finished
-        let outstanding_ptr = self.outstanding_refs.load(Ordering::Acquire);
+        let outstanding_ptr = slf.outstanding_refs.load(Ordering::Acquire);
         if let Some(outstanding) = unsafe { outstanding_ptr.as_ref() } {
             if outstanding.fetch_sub(1, Ordering::AcqRel) != 1 {
                 // there are outstanding references left, so we can't free the id yet.
+
+                // signal that there is no more manual cleanup required for future threads that get assigned this
+                // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
+                // even though the entry is completely unused.
+                slf.guard.store(GUARD_EMPTY, Ordering::Release);
                 return;
             }
             mem::forget(outstanding);
             println!("free mem!");
             // free the memory again
             let _ = Box::from_raw(outstanding_ptr);
+        } else {
+            panic!("no outstanding refs!");
         }
-        println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
+        println!("freeeeeeeing {} in {:?} glob {:?}", slf.id, slf.tid_manager, global_tid_manager());
+        // signal that there is no more manual cleanup required for future threads that get assigned this
+        // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
+        // even though the entry is completely unused.
+        slf.guard.store(GUARD_EMPTY, Ordering::Release);
+
         // the tid_manager is either an `alternative` id manager or the `global` tid manager.
-        unsafe { self.tid_manager.as_ref() }.lock().unwrap().free(self.id);
+        unsafe { slf.tid_manager.as_ref() }.lock().unwrap().free(slf.id);
     }
 
 }
@@ -422,7 +460,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Thre
             for entry in unfinished.into_iter() {
                 let entry = unsafe { &*entry };
                 let backoff = Backoff::new();
-                while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE_EXTERNAL {
+                while is_active_external::<AUTO_FREE_IDS>(entry.guard.load(Ordering::Acquire)) {
                     backoff.snooze();
                 }
             }
@@ -450,7 +488,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Thre
             for offset in 0..this_bucket_size {
                 let entry = unsafe { bucket_ptr.add(offset).as_ref().unwrap_unchecked() };
                 let backoff = Backoff::new();
-                while entry.guard.load(Ordering::Acquire) == GUARD_ACTIVE_EXTERNAL {
+                while is_active_external::<AUTO_FREE_IDS>(entry.guard.load(Ordering::Acquire)) {
                     backoff.snooze();
                 }
             }

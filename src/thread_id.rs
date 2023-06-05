@@ -155,6 +155,16 @@ impl FreeList {
                 THREAD_ID_MANAGER.lock().unwrap().free(id);
             }
         } else {
+            if outstanding == 0 {
+                // free the memory again
+                let _ = unsafe { Box::from_raw(outstanding_shared) };
+                // perform the actual cleanup of the id
+                let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
+                // Release the thread ID. Any further accesses to the thread ID
+                // will go through get_slow which will either panic or
+                // initialize a new ThreadGuard.
+                THREAD_ID_MANAGER.lock().unwrap().free(id);
+            }
             println!("no diff!");
         }
     }

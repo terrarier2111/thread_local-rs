@@ -327,7 +327,7 @@ impl<T, M: Metadata, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FREE_IDS> {
         // this also disables the cleanup of this entry in the `normal` entry
         // on destruction of the central struct.
         slf.free_list.store(null_mut(), Ordering::Release);
-        println!("set free manually {:?}", slf as *const Entry<T, M, AUTO_FREE_IDS>);
+        println!("set free manually id {} addr {:?}", slf.id, slf as *const Entry<T, M, AUTO_FREE_IDS>);
         slf.guard.store(if AUTO_FREE_IDS { GUARD_EMPTY } else { GUARD_FREE_MANUALLY }, Ordering::Release); // FIXME: is it okay to store GUARD_EMPTY even if there is still an alternative_entry present?
         AUTO_FREE_IDS
     }

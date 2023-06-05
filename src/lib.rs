@@ -441,13 +441,11 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Thre
         let mut bucket_size = 1;
 
         // Free each non-null bucket
-        for (i, bucket) in self.buckets.iter().enumerate() {
+        for bucket in self.buckets.iter() {
             let bucket_ptr = bucket.load(Ordering::Relaxed);
 
             let this_bucket_size = bucket_size;
-            if i != 0 {
-                bucket_size <<= 1;
-            }
+            bucket_size <<= 1;
 
             if bucket_ptr.is_null() {
                 // we went up high enough to find an empty bucket, we now know that
@@ -477,13 +475,11 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Thre
         bucket_size = 1;
 
         // free alternative buckets
-        for (i, bucket) in self.alternative_buckets.iter().enumerate() {
+        for bucket in self.alternative_buckets.iter() {
             let bucket_ptr = bucket.load(Ordering::Relaxed);
 
             let this_bucket_size = bucket_size;
-            if i != 0 {
-                bucket_size <<= 1;
-            }
+            bucket_size <<= 1;
 
             if bucket_ptr.is_null() {
                 // we went up high enough to find an empty bucket, we now know that
@@ -505,13 +501,11 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Thre
         bucket_size = 1;
 
         // Free each non-null bucket
-        for (i, bucket) in self.buckets.iter_mut().enumerate() {
+        for bucket in self.buckets.iter_mut() {
             let bucket_ptr = *bucket.get_mut();
 
             let this_bucket_size = bucket_size;
-            if i != 0 {
-                bucket_size <<= 1;
-            }
+            bucket_size <<= 1;
 
             if bucket_ptr.is_null() {
                 // we went up high enough to find an empty bucket, we now know that
@@ -525,13 +519,11 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Thre
         bucket_size = 1;
 
         // free alternative buckets
-        for (i, bucket) in self.alternative_buckets.iter_mut().enumerate() {
+        for bucket in self.alternative_buckets.iter_mut() {
             let bucket_ptr = *bucket.get_mut();
 
             let this_bucket_size = bucket_size;
-            if i != 0 {
-                bucket_size <<= 1;
-            }
+            bucket_size <<= 1;
 
             if bucket_ptr.is_null() {
                 // we went up high enough to find an empty bucket, we now know that
@@ -554,19 +546,15 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
     /// access the thread local it will never reallocate. The capacity may be rounded up to the
     /// nearest power of two.
     pub fn with_capacity(capacity: usize) -> ThreadLocal<T, M, AUTO_FREE_IDS> {
-        let allocated_buckets = capacity
-            .checked_sub(1)
-            .map(|c| usize::from(POINTER_WIDTH) - (c.leading_zeros() as usize) + 1)
-            .unwrap_or(0);
+        let allocated_buckets = usize::from(POINTER_WIDTH) - (capacity.leading_zeros() as usize);
+        println!("allocated buckets: {}", allocated_buckets);
 
         let mut buckets = [null_mut(); BUCKETS];
         let mut bucket_size = 1;
         for (i, bucket) in buckets[..allocated_buckets].iter_mut().enumerate() {
             *bucket = allocate_bucket::<false, AUTO_FREE_IDS, T, M>(bucket_size, global_tid_manager(), i);
 
-            if i != 0 {
-                bucket_size <<= 1;
-            }
+            bucket_size <<= 1;
         }
 
         let tid_manager = SizedBox::new(Mutex::new(ThreadIdManager::new()));
@@ -580,9 +568,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
             let tid_manager = unsafe { NonNull::new_unchecked((tid_manager.as_ref() as *const Mutex<ThreadIdManager>).cast_mut()) };
             *bucket = allocate_bucket::<true, AUTO_FREE_IDS, T, M>(bucket_size, tid_manager, i);
 
-            if i != 0 {
-                bucket_size <<= 1;
-            }
+            bucket_size <<= 1;
         }
 
         Self {
@@ -938,9 +924,7 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
 
     #[inline]
     fn next_bucket(&mut self) {
-        if self.bucket != 0 {
-            self.bucket_size <<= 1;
-        }
+        self.bucket_size <<= 1;
         self.bucket += 1;
         self.index = 0;
     }
@@ -1128,10 +1112,10 @@ fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Sen
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
                 tid_manager,
                 id: {
-                    println!("calced id: {}[{}]: {}", bucket, n, ((1 << bucket) >> 1) + n);
+                    println!("calced id: {}[{}]: {}", bucket, n, (1 << bucket) - 1 + n);
                     // special case the first bucket as the first two buckets both only have a single entry (that's why the sub has to be saturating).
                     // we need to offset all entries by the number of all entries of previous buckets.
-                    ((1 << bucket) >> 1) + n
+                    (1 << bucket) - 1 + n
                 },
                 guard: AtomicUsize::new(GUARD_UNINIT),
                 alternative_entry: AtomicPtr::new(null_mut()),
@@ -1276,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn iter() {
+    fn iter() { // FIXME: fix this test!
         let tls = Arc::new(ThreadLocal::<Box<i32>, ()>::new());
         tls.get_or(|_| Box::new(1), |_| {});
 

@@ -5,7 +5,8 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use crate::{Entry, POINTER_WIDTH};
+use std::cell::Cell;
+use crate::{BUCKETS, Entry, POINTER_WIDTH};
 use once_cell::sync::Lazy;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -13,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::mem;
 use std::ops::Deref;
-use std::ptr::NonNull;
+use std::ptr::{NonNull, null};
 
 /// Thread ID manager which allocates thread IDs. It attempts to aggressively
 /// reuse thread IDs where possible to avoid cases where a ThreadLocal grows
@@ -76,9 +77,9 @@ pub(crate) struct Thread {
 
 impl Thread {
     fn new(id: usize, free_list: *const FreeList) -> Self {
-        let bucket = usize::from(POINTER_WIDTH) - id.leading_zeros() as usize;
-        let bucket_size = 1 << bucket.saturating_sub(1);
-        let index = if id != 0 { id ^ bucket_size } else { 0 };
+        let bucket = usize::from(POINTER_WIDTH) - ((id + 1).leading_zeros() as usize) - 1;
+        let bucket_size = 1 << bucket;
+        let index = id - (bucket_size - 1);
 
         Self {
             id,
@@ -91,16 +92,16 @@ impl Thread {
     /// The size of the bucket this thread's local storage will be in.
     #[inline]
     pub(crate) fn bucket_size(&self) -> usize {
-        1 << self.bucket.saturating_sub(1)
+        1 << self.bucket
     }
 }
 
 /// returns the bucket, bucket size and index of the given id
 #[inline]
 pub(crate) fn id_into_parts(id: usize) -> (usize, usize, usize) {
-    let bucket = usize::from(POINTER_WIDTH) - id.leading_zeros() as usize;
-    let bucket_size = 1 << bucket.saturating_sub(1);
-    let index = if id != 0 { id ^ bucket_size } else { 0 };
+    let bucket = usize::from(POINTER_WIDTH) - ((id + 1).leading_zeros() as usize) - 1;
+    let bucket_size = 1 << bucket;
+    let index = id - (bucket_size - 1);
 
     (bucket, bucket_size, index)
 }
@@ -244,24 +245,24 @@ fn test_thread() {
     let thread = Thread::new(1, null());
     assert_eq!(thread.id, 1);
     assert_eq!(thread.bucket, 1);
-    assert_eq!(thread.bucket_size(), 1);
+    assert_eq!(thread.bucket_size(), 2);
     assert_eq!(thread.index, 0);
 
     let thread = Thread::new(2, null());
     assert_eq!(thread.id, 2);
-    assert_eq!(thread.bucket, 2);
+    assert_eq!(thread.bucket, 1);
     assert_eq!(thread.bucket_size(), 2);
-    assert_eq!(thread.index, 0);
+    assert_eq!(thread.index, 1);
 
     let thread = Thread::new(3, null());
     assert_eq!(thread.id, 3);
     assert_eq!(thread.bucket, 2);
-    assert_eq!(thread.bucket_size(), 2);
-    assert_eq!(thread.index, 1);
+    assert_eq!(thread.bucket_size(), 4);
+    assert_eq!(thread.index, 0);
 
     let thread = Thread::new(19, null());
     assert_eq!(thread.id, 19);
-    assert_eq!(thread.bucket, 5);
+    assert_eq!(thread.bucket, 4);
     assert_eq!(thread.bucket_size(), 16);
-    assert_eq!(thread.index, 3);
+    assert_eq!(thread.index, 4);
 }

@@ -126,6 +126,7 @@ impl FreeList {
     fn cleanup(&self) {
         self.dropping.store(true, Ordering::Release);
         let free_list = self.free_list.lock();
+        println!("alloced shared counter!");
         let outstanding_shared = Box::into_raw(Box::new(AtomicUsize::new(usize::MAX)));
         let mut outstanding = 0;
         for entry in free_list.unwrap().iter() {

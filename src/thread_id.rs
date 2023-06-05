@@ -36,11 +36,14 @@ impl ThreadIdManager {
         let ret = if let Some(id) = self.free_list.pop() {
             id.0
         } else {
+            // we don't allow 1 before MAX to be returned because our buckets can only contain
+            // up to usize::MAX - 1 elements, but this shouldn't have any impact in practice.
+            if self.free_from >= usize::MAX - 1 {
+                panic!("Ran out of thread IDs");
+            }
+
             let id = self.free_from;
-            self.free_from = self
-                .free_from
-                .checked_add(1)
-                .expect("Ran out of thread IDs");
+            self.free_from += 1;
             id
         };
         println!("alloced tid: {}", ret);

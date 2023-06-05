@@ -99,7 +99,7 @@ const POINTER_WIDTH: u8 = 32;
 const POINTER_WIDTH: u8 = 64;
 
 /// The total number of buckets stored in each thread local.
-const BUCKETS: usize = (POINTER_WIDTH + 1) as usize;
+const BUCKETS: usize = (POINTER_WIDTH - 1) as usize;
 
 /// Thread-local variable wrapper
 ///
@@ -122,7 +122,7 @@ const GUARD_READY: usize = 2;
 const GUARD_ACTIVE_INTERNAL: usize = 3;
 const GUARD_ACTIVE_EXTERNAL: usize = 4;
 const GUARD_ACTIVE_ITERATOR: usize = 5;
-const GUARD_FREE_MANUALLY: usize = 6; // FIXME: if we store this once, when are we able to reuse the entry again?
+const GUARD_FREE_MANUALLY: usize = 6;
 const GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG: usize = 1 << (usize::BITS - 1);
 
 #[inline]

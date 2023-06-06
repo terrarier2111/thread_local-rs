@@ -275,10 +275,10 @@ pub(crate) fn get() -> Thread {
 fn get_slow() -> Thread {
     let tid = THREAD_ID_MANAGER.lock().unwrap().alloc();
     unsafe {
-        FREE_LIST = Some(ManuallyDrop(FreeList::new(tid)));
+        FREE_LIST = Some(ManuallyDrop::new(FreeList::new(tid)));
     }
     let new = Thread::new(tid, unsafe {
-        FREE_LIST.as_ref().unwrap_unchecked() as *const FreeList
+        FREE_LIST.as_ref().unwrap_unchecked().deref() as *const FreeList
     });
     unsafe {
         THREAD = Some(new);

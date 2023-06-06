@@ -25,7 +25,6 @@ use std::ptr::{NonNull, null};
 pub(crate) struct ThreadIdManager {
     free_from: usize,
     free_list: BinaryHeap<Reverse<usize>>,
-    limbo_list: Vec<usize>,
 }
 
 impl ThreadIdManager {
@@ -34,7 +33,6 @@ impl ThreadIdManager {
         Self {
             free_from: 0,
             free_list: BinaryHeap::new(),
-            limbo_list: vec![],
         }
     }
 
@@ -42,19 +40,6 @@ impl ThreadIdManager {
         if let Some(id) = self.free_list.pop() {
             println!("alloced tid: {}", id.0);
             return id.0;
-        }
-
-        if !self.limbo_list.is_empty() {
-            let id = self.limbo_list.remove(0);
-            let (bucket, _, index) = id_into_parts(id);
-            let counter = unsafe { SHARED_IDS[bucket].get().offset(index as isize).as_ref().unwrap_unchecked() };
-            // check if there are outstanding entries using the limboed id
-            if counter.load(Ordering::Acquire) == 0 {
-                // yay! there are no more outstanding entries!
-                return id;
-            }
-
-            self.limbo_list.push(id);
         }
 
         // we don't allow 1 before MAX to be returned because our buckets can only contain
@@ -68,7 +53,6 @@ impl ThreadIdManager {
 
         if id % 2 == 0 {
             let bucket = POINTER_WIDTH as usize - id.leading_zeros() as usize + 1;
-            println!("indexing by bucket {}", bucket);
             let bucket_size = 1 << bucket;
             SHARED_IDS[bucket].set(alloc_shared(bucket_size));
         }
@@ -86,17 +70,6 @@ impl ThreadIdManager {
         }
 
         self.free_list.push(Reverse(id));
-    }
-
-    pub(crate) fn free_limbo(&mut self, id: usize) {
-        if self.free_list.iter().find(|x| x.0 == id).is_some() {
-            panic!("double freed tid!");
-        }
-        if self.free_from <= id {
-            panic!("freed tid although tid was never handed out {} max {} glob {:?} local {:?}", id, self.free_from, global_tid_manager(), self as *const ThreadIdManager);
-        }
-
-        self.limbo_list.push(id);
     }
 
 }

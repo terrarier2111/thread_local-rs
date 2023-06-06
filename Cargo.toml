@@ -15,6 +15,9 @@ rust-version = "1.59"
 # this feature provides performance improvements using nightly features
 nightly = []
 
+[profile.release]
+debug = true
+
 [badges]
 travis-ci = { repository = "Amanieu/thread_local-rs" }
 

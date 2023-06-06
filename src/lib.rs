@@ -102,7 +102,7 @@ const POINTER_WIDTH: u8 = 64;
 /// We subtract the number of powers of two that the size of
 /// a word make in difference because every bucket we will ever
 /// use will at least be word-sized.
-const BUCKETS: usize = (POINTER_WIDTH - (POINTER_WIDTH - POINTER_SIZE_BYTES.leading_zeros() as u8)) as usize;
+const BUCKETS: usize = (POINTER_WIDTH - POINTER_SIZE_BYTES.leading_zeros() as u8) as usize;
 const POINTER_SIZE_BYTES: u8 = POINTER_WIDTH / 8;
 
 /// Thread-local variable wrapper

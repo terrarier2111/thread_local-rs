@@ -15,7 +15,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::mem;
-use std::mem::transmute;
+use std::mem::{ManuallyDrop, transmute};
 use std::ops::Deref;
 use std::ptr::{NonNull, null};
 use rustc_hash::{FxHasher, FxHashMap};
@@ -29,11 +29,10 @@ pub(crate) struct ThreadIdManager {
 }
 
 impl ThreadIdManager {
-    fn new() -> Self {
-        SHARED_IDS[0].set(alloc_shared(1));
+    const fn new() -> Self {
         Self {
             free_from: 0,
-            free_list: BinaryHeap::new(),
+            free_list: unsafe { transmute::<Vec<Reverse<usize>>, BinaryHeap<Reverse<usize>>>(Vec::new()) }, // FIXME: this is unsound, use const constructor, once its available!
         }
     }
 
@@ -53,6 +52,10 @@ impl ThreadIdManager {
         self.free_from += 1;
 
         if id % 2 == 0 {
+            if id == 0 {
+                SHARED_IDS[0].set(alloc_shared(1));
+            }
+
             let bucket = POINTER_WIDTH as usize - id.leading_zeros() as usize + 1;
             let bucket_size = 1 << bucket;
             SHARED_IDS[bucket].set(alloc_shared(bucket_size));
@@ -94,8 +97,7 @@ fn alloc_shared(size: usize) -> *const AtomicUsize {
     ret.cast::<AtomicUsize>().cast_const()
 }
 
-static THREAD_ID_MANAGER: Lazy<Mutex<ThreadIdManager>> =
-    Lazy::new(|| Mutex::new(ThreadIdManager::new()));
+static THREAD_ID_MANAGER: Mutex<ThreadIdManager> = Mutex::new(ThreadIdManager::new());
 
 pub(crate) static SHARED_IDS: [PtrCell<AtomicUsize>; BUCKETS] = {
     unsafe { transmute([null::<AtomicUsize>(); BUCKETS]) }
@@ -212,11 +214,11 @@ impl FreeList {
             unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.store(outstanding, Ordering::Release);
         } else {
             // perform the actual cleanup of the id
-            let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
+
             // Release the thread ID. Any further accesses to the thread ID
             // will go through get_slow which will either panic or
             // initialize a new ThreadGuard.
-            THREAD_ID_MANAGER.lock().unwrap().free(id); // FIXME: this panicked with a poison error!
+            THREAD_ID_MANAGER.lock().unwrap().free(self.id);
         }
     }
 }
@@ -240,7 +242,7 @@ impl EntryData {
 #[thread_local]
 static mut THREAD: Option<Thread> = None;
 #[thread_local]
-static mut FREE_LIST: Option<FreeList> = None;
+static mut FREE_LIST: Option<ManuallyDrop<FreeList>> = None;
 thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard }; }
 
 // Guard to ensure the thread ID is released on thread exit.
@@ -249,10 +251,11 @@ struct ThreadGuard;
 impl Drop for ThreadGuard {
     fn drop(&mut self) {
         unsafe {
+            let reference = FREE_LIST.as_ref().unwrap_unchecked().deref();
             // first clean up all entries in the freelist
-            FREE_LIST.as_ref().unwrap_unchecked().cleanup();
+            reference.cleanup();
             // ... then clean up the freelist itself.
-            FREE_LIST.take();
+            (reference as *const FreeList).read();
         }
     }
 }
@@ -272,7 +275,7 @@ pub(crate) fn get() -> Thread {
 fn get_slow() -> Thread {
     let tid = THREAD_ID_MANAGER.lock().unwrap().alloc();
     unsafe {
-        FREE_LIST = Some(FreeList::new(tid));
+        FREE_LIST = Some(ManuallyDrop(FreeList::new(tid)));
     }
     let new = Thread::new(tid, unsafe {
         FREE_LIST.as_ref().unwrap_unchecked() as *const FreeList

@@ -138,8 +138,7 @@ unsafe impl<T: Sync> Sync for PtrCell<T> {}
 /// A thread ID may be reused after a thread exits.
 #[derive(Copy, Clone)]
 pub(crate) struct Thread {
-    /// The thread ID obtained from the thread ID manager.
-    pub(crate) id: usize,
+    // FIXME: should we rather just store the id and recompute bucket and index every time we need them?
     /// The bucket this thread's local storage will be in.
     pub(crate) bucket: usize,
     /// The index into the bucket this thread's local storage is in.
@@ -152,7 +151,6 @@ impl Thread {
         let (bucket, _, index) = id_into_parts(id);
 
         Self {
-            id,
             bucket,
             index,
             free_list,
@@ -291,31 +289,26 @@ fn get_slow() -> Thread {
 fn test_thread() {
     use std::ptr::null;
     let thread = Thread::new(0, null());
-    assert_eq!(thread.id, 0);
     assert_eq!(thread.bucket, 0);
     assert_eq!(thread.bucket_size(), 1);
     assert_eq!(thread.index, 0);
 
     let thread = Thread::new(1, null());
-    assert_eq!(thread.id, 1);
     assert_eq!(thread.bucket, 1);
     assert_eq!(thread.bucket_size(), 2);
     assert_eq!(thread.index, 0);
 
     let thread = Thread::new(2, null());
-    assert_eq!(thread.id, 2);
     assert_eq!(thread.bucket, 1);
     assert_eq!(thread.bucket_size(), 2);
     assert_eq!(thread.index, 1);
 
     let thread = Thread::new(3, null());
-    assert_eq!(thread.id, 3);
     assert_eq!(thread.bucket, 2);
     assert_eq!(thread.bucket_size(), 4);
     assert_eq!(thread.index, 0);
 
     let thread = Thread::new(19, null());
-    assert_eq!(thread.id, 19);
     assert_eq!(thread.bucket, 4);
     assert_eq!(thread.bucket_size(), 16);
     assert_eq!(thread.index, 4);

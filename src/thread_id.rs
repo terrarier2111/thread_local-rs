@@ -68,6 +68,7 @@ impl ThreadIdManager {
 
         if id % 2 == 0 {
             let bucket = POINTER_WIDTH as usize - id.leading_zeros() as usize + 1;
+            println!("indexing by bucket {}", bucket);
             let bucket_size = 1 << bucket;
             SHARED_IDS[bucket].set(alloc_shared(bucket_size));
         }
@@ -242,7 +243,7 @@ impl FreeList {
             // Release the thread ID. Any further accesses to the thread ID
             // will go through get_slow which will either panic or
             // initialize a new ThreadGuard.
-            THREAD_ID_MANAGER.lock().unwrap().free(id);
+            THREAD_ID_MANAGER.lock().unwrap().free(id); // FIXME: this panicked with a poison error!
         }
     }
 }

@@ -74,7 +74,7 @@ mod thread_id;
 mod unreachable;
 
 use std::alloc::{alloc, dealloc, Layout};
-use crate::thread_id::{EntryData, FreeList, global_tid_manager, shared_id_ptr, Thread, ThreadIdManager};
+use crate::thread_id::{EntryData, free_id, FreeList, shared_id_ptr, Thread, ThreadIdManager};
 use crossbeam_utils::Backoff;
 use smallvec::{smallvec, SmallVec};
 use std::cell::UnsafeCell;
@@ -245,7 +245,6 @@ pub struct RefAccess;
 
 // FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
 struct Entry<T, M: Send + Sync + Default = (), const AUTO_FREE_IDS: bool = true> {
-    tid_manager: NonNull<Mutex<ThreadIdManager>>,
     id: usize,
     guard: AtomicUsize,
     free_list: AtomicPtr<FreeList>,
@@ -386,8 +385,7 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
         // even though the entry is completely unused.
         self.guard.store(GUARD_EMPTY, Ordering::Release);
 
-        // the tid_manager is either an `alternative` id manager or the `global` tid manager.
-        unsafe { self.tid_manager.as_ref() }.lock().unwrap().free(self.id);
+        free_id(self.id);
     }
 
 }
@@ -485,7 +483,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         let mut buckets = [null_mut(); BUCKETS];
         let mut bucket_size = 1;
         for (i, bucket) in buckets[..allocated_buckets].iter_mut().enumerate() {
-            *bucket = allocate_bucket::<false, AUTO_FREE_IDS, T, M>(bucket_size, global_tid_manager(), i);
+            *bucket = allocate_bucket::<false, AUTO_FREE_IDS, T, M>(bucket_size, i);
 
             bucket_size <<= 1;
         }
@@ -543,7 +541,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket::<false, AUTO_FREE_IDS, T, M>(thread.bucket_size(), global_tid_manager(), thread.bucket);
+            let new_bucket = allocate_bucket::<false, AUTO_FREE_IDS, T, M>(thread.bucket_size(), thread.bucket);
 
             match bucket_atomic_ptr.compare_exchange(
                 null_mut(),
@@ -905,11 +903,10 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator for 
 
 impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> FusedIterator for IntoIter<T, M, AUTO_FREE_IDS> {}
 
-fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Send + Sync + Default>(size: usize, tid_manager: NonNull<Mutex<ThreadIdManager>>, bucket: usize) -> *mut Entry<T, M, AUTO_FREE_IDS> {
+fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Send + Sync + Default>(size: usize, bucket: usize) -> *mut Entry<T, M, AUTO_FREE_IDS> {
     Box::into_raw(
         (0..size)
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
-                tid_manager,
                 id: {
                     // println!("calced id: {}[{}]: {}", bucket, n, (1 << bucket) - 1 + n);
                     // we need to offset all entries by the number of all entries of previous buckets.

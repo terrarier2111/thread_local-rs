@@ -145,9 +145,7 @@ pub(crate) struct Thread {
 
 impl Thread {
     fn new(id: usize, free_list: *const FreeList) -> Self {
-        let bucket = usize::from(POINTER_WIDTH) - ((id + 1).leading_zeros() as usize) - 1;
-        let bucket_size = 1 << bucket;
-        let index = id - (bucket_size - 1);
+        let (bucket, _, index) = id_into_parts(id);
 
         Self {
             id,
@@ -158,7 +156,7 @@ impl Thread {
     }
 
     /// The size of the bucket this thread's local storage will be in.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn bucket_size(&self) -> usize {
         1 << self.bucket
     }
@@ -174,9 +172,8 @@ pub(crate) fn id_into_parts(id: usize) -> (usize, usize, usize) {
     (bucket, bucket_size, index)
 }
 
-#[inline]
-pub(crate) fn global_tid_manager() -> NonNull<Mutex<ThreadIdManager>> {
-    unsafe { NonNull::new_unchecked((THREAD_ID_MANAGER.deref() as *const Mutex<ThreadIdManager>).cast_mut()) }
+pub(crate) fn free_id(id: usize) {
+    THREAD_ID_MANAGER.lock().unwrap().free(id);
 }
 
 pub(crate) struct FreeList {

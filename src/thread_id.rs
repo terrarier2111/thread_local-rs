@@ -10,7 +10,7 @@ use std::cell::Cell;
 use crate::{BUCKETS, Entry, POINTER_WIDTH};
 use once_cell::sync::Lazy;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -18,6 +18,7 @@ use std::mem;
 use std::mem::transmute;
 use std::ops::Deref;
 use std::ptr::{NonNull, null};
+use rustc_hash::{FxHasher, FxHashMap};
 
 /// Thread ID manager which allocates thread IDs. It attempts to aggressively
 /// reuse thread IDs where possible to avoid cases where a ThreadLocal grows
@@ -100,6 +101,7 @@ pub(crate) static SHARED_IDS: [PtrCell<AtomicUsize>; BUCKETS] = {
     unsafe { transmute([null::<AtomicUsize>(); BUCKETS]) }
 };
 
+#[inline]
 pub(crate) unsafe fn shared_id_ptr(id: usize) -> *const AtomicUsize {
     let (bucket, _, index) = id_into_parts(id);
     SHARED_IDS[bucket].get().offset(index as isize)
@@ -172,6 +174,7 @@ pub(crate) fn id_into_parts(id: usize) -> (usize, usize, usize) {
     (bucket, bucket_size, index)
 }
 
+#[inline]
 pub(crate) fn free_id(id: usize) {
     THREAD_ID_MANAGER.lock().unwrap().free(id);
 }
@@ -179,7 +182,7 @@ pub(crate) fn free_id(id: usize) {
 pub(crate) struct FreeList {
     id: usize,
     pub(crate) dropping: AtomicBool,
-    pub(crate) free_list: Mutex<HashMap<usize, EntryData>>,
+    pub(crate) free_list: Mutex<FxHashMap<usize, EntryData>>,
 }
 
 impl FreeList {
@@ -187,7 +190,7 @@ impl FreeList {
         Self {
             id,
             dropping: Default::default(),
-            free_list: Mutex::new(Default::default()),
+            free_list: Mutex::new(FxHashMap::default()),
         }
     }
 

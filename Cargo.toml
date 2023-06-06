@@ -29,6 +29,7 @@ memoffset = "0.8.0"
 thread-id = "4.0.0"
 crossbeam-utils = "0.8.15"
 smallvec = { version = "1.10.0", features = ["union", "const_generics"] }
+rustc-hash = "1.1.0"
 
 [dev-dependencies]
 criterion = "0.4.0"

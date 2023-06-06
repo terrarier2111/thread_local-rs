@@ -38,7 +38,7 @@ impl ThreadIdManager {
 
     pub(crate) fn alloc(&mut self) -> usize {
         if let Some(id) = self.free_list.pop() {
-            println!("alloced tid: {}", id.0);
+            // println!("alloced tid: {}", id.0);
             return id.0;
         }
 
@@ -57,7 +57,7 @@ impl ThreadIdManager {
             SHARED_IDS[bucket].set(alloc_shared(bucket_size));
         }
 
-        println!("alloced tid: {}", id);
+        // println!("alloced tid: {}", id);
         id
     }
 
@@ -197,7 +197,7 @@ impl FreeList {
     fn cleanup(&self) {
         self.dropping.store(true, Ordering::Release);
         let free_list = self.free_list.lock();
-        println!("alloced shared counter!");
+        // println!("alloced shared counter!");
         let outstanding_shared = unsafe { shared_id_ptr(self.id) };
         let mut outstanding = 0;
         for entry in free_list.unwrap().iter() {

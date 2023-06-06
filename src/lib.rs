@@ -335,7 +335,7 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
         // this also disables the cleanup of this entry in the `normal` entry
         // on destruction of the central struct.
         slf.free_list.store(null_mut(), Ordering::Release);
-        println!("set free manually id {} addr {:?}", slf.id, slf as *const Entry<T, M, AUTO_FREE_IDS>);
+        // println!("set free manually id {} addr {:?}", slf.id, slf as *const Entry<T, M, AUTO_FREE_IDS>);
 
         if AUTO_FREE_IDS {
             slf.guard.store(GUARD_EMPTY, Ordering::Release); // FIXME: is it okay to store GUARD_EMPTY even if there is still an alternative_entry present?
@@ -363,7 +363,7 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
             self.guard.store(GUARD_ACTIVE_EXTERNAL | GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG, Ordering::Release);
             return;
         }
-        println!("free_id call {}", self.id);
+        // println!("free_id call {}", self.id);
         // check if we are a "main" entry and our thread is finished
         let outstanding = shared_id_ptr(self.id).as_ref().unwrap_unchecked();
         let backoff = Backoff::new();
@@ -380,7 +380,7 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
             self.guard.store(GUARD_EMPTY, Ordering::Release);
             return;
         }
-        println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
+        // println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
         // signal that there is no more manual cleanup required for future threads that get assigned this
         // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
         // even though the entry is completely unused.
@@ -480,7 +480,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
     /// nearest power of two.
     pub fn with_capacity(capacity: usize) -> ThreadLocal<T, M, AUTO_FREE_IDS> {
         let allocated_buckets = usize::from(POINTER_WIDTH) - (capacity.leading_zeros() as usize);
-        println!("allocated buckets: {}", allocated_buckets);
+        // println!("allocated buckets: {}", allocated_buckets);
 
         let mut buckets = [null_mut(); BUCKETS];
         let mut bucket_size = 1;
@@ -514,7 +514,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
             return val;
         }
 
-        println!("failed fetching entry of: {}", thread.id);
+        // println!("failed fetching entry of: {}", thread.id);
         self.insert(create, meta)
     }
 
@@ -569,7 +569,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
 
         // check if the entry isn't cleaned up automatically
         if entry.guard.load(Ordering::Acquire) == GUARD_FREE_MANUALLY {
-            println!("to be freed entry: freelist {:?} id {} tid_manager: {:?}", entry.free_list.load(Ordering::Acquire), entry.id, entry.tid_manager);
+            // println!("to be freed entry: freelist {:?} id {} tid_manager: {:?}", entry.free_list.load(Ordering::Acquire), entry.id, entry.tid_manager);
             panic!("found entry which should have been manually freed!");
         }
 
@@ -911,7 +911,7 @@ fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Sen
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
                 tid_manager,
                 id: {
-                    println!("calced id: {}[{}]: {}", bucket, n, (1 << bucket) - 1 + n);
+                    // println!("calced id: {}[{}]: {}", bucket, n, (1 << bucket) - 1 + n);
                     // we need to offset all entries by the number of all entries of previous buckets.
                     (1 << bucket) - 1 + n
                 },

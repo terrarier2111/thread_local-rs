@@ -75,7 +75,7 @@ mod unreachable;
 
 use std::alloc::{alloc, dealloc, Layout};
 use crate::thread_id::{EntryData, free_id, FreeList, shared_id_ptr, Thread, ThreadIdManager};
-use crossbeam_utils::Backoff;
+use crossbeam_utils::{Backoff, CachePadded};
 use smallvec::{smallvec, SmallVec};
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -245,6 +245,7 @@ pub struct RefAccess;
 
 // FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
 struct Entry<T, M: Send + Sync + Default = (), const AUTO_FREE_IDS: bool = true> {
+    aligned: CachePadded<()>,
     id: usize,
     guard: AtomicUsize,
     free_list: AtomicPtr<FreeList>,

@@ -908,6 +908,7 @@ fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Sen
     Box::into_raw(
         (0..size)
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
+                aligned: Default::default(),
                 id: {
                     // println!("calced id: {}[{}]: {}", bucket, n, (1 << bucket) - 1 + n);
                     // we need to offset all entries by the number of all entries of previous buckets.

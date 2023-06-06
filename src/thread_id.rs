@@ -225,35 +225,17 @@ impl FreeList {
         let free_list = self.free_list.lock();
         println!("alloced shared counter!");
         let outstanding_shared = unsafe { shared_id_ptr(self.id) };
-        unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.store(usize::MAX, Ordering::Release);
         let mut outstanding = 0;
         for entry in free_list.unwrap().iter() {
             // sum up all the "failed" cleanups
-            if unsafe { !entry.1.cleanup(*entry.0 as *const Entry<()>, outstanding_shared) } {
+            if unsafe { !entry.1.cleanup(*entry.0 as *const Entry<()>) } {
                 outstanding += 1;
             }
         }
 
         if outstanding > 0 {
-            // store the actual number of outstanding references and ensure that all
-            // updates that happened before are applied to the actual value after
-            // the initial store and cleanup the id if there are no actual outstanding
-            // references left after syncing the references.
-            let prev = unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.swap(outstanding, Ordering::Release);
-            let diff = usize::MAX - prev;
-            if diff > 0 {
-                println!("racing diff {}", diff);
-                if unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.fetch_sub(diff, Ordering::AcqRel) == diff {
-                    // perform the actual cleanup of the id
-                    let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
-                    // Release the thread ID. Any further accesses to the thread ID
-                    // will go through get_slow which will either panic or
-                    // initialize a new ThreadGuard.
-                    THREAD_ID_MANAGER.lock().unwrap().free(id);
-                }
-            } else {
-                println!("no diff!");
-            }
+            // store the number of outstanding references
+            unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.store(outstanding, Ordering::Release);
         } else {
             // perform the actual cleanup of the id
             let id = unsafe { THREAD.as_ref().unwrap_unchecked() }.id;
@@ -266,14 +248,14 @@ impl FreeList {
 }
 
 pub(crate) struct EntryData {
-    pub(crate) drop_fn: unsafe fn(*const Entry<()>, *const AtomicUsize) -> bool,
+    pub(crate) drop_fn: unsafe fn(*const Entry<()>) -> bool,
 }
 
 impl EntryData {
     #[inline]
-    unsafe fn cleanup(&self, data: *const Entry<()>, outstanding: *const AtomicUsize) -> bool {
+    unsafe fn cleanup(&self, data: *const Entry<()>) -> bool {
         let dfn = self.drop_fn;
-        dfn(data, outstanding)
+        dfn(data)
     }
 }
 

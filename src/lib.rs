@@ -310,7 +310,7 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
     }
 
     /// This will get called when the thread associated with this entry exits.
-    pub(crate) unsafe fn cleanup(slf: *const Entry<()>, remaining_cnt: *const AtomicUsize) -> bool {
+    pub(crate) unsafe fn cleanup(slf: *const Entry<()>) -> bool {
         let slf = unsafe { &*slf.cast::<Entry<T, M, AUTO_FREE_IDS>>() };
         let backoff = Backoff::new();
         while slf
@@ -359,34 +359,35 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
 
     /// SAFETY: This may only be called after the thread associated with this thread local has finished.
     unsafe fn free_id(&self) {
-        if self.guard.load(Ordering::Acquire) != GUARD_ACTIVE_EXTERNAL {
-            println!("free_id call {}", self.id);
-            // check if we are a "main" entry and our thread is finished
-            let outstanding_ptr = shared_id_ptr(self.id);
-            if let Some(outstanding) = unsafe { outstanding_ptr.as_ref() } { // FIXME: we should be able to unwrap this unchecked, as it should never be null
-                if outstanding.fetch_sub(1, Ordering::AcqRel) != 1 {
-                    // there are outstanding references left, so we can't free the id yet.
+        if self.guard.load(Ordering::Acquire) == GUARD_ACTIVE_EXTERNAL {
+            self.guard.store(GUARD_ACTIVE_EXTERNAL | GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG, Ordering::Release);
+            return;
+        }
+        println!("free_id call {}", self.id);
+        // check if we are a "main" entry and our thread is finished
+        let outstanding = shared_id_ptr(self.id).as_ref().unwrap_unchecked();
+        let backoff = Backoff::new();
+        // wait for the outstanding refs to be set
+        while outstanding.load(Ordering::Acquire) == 0 {
+            backoff.snooze();
+        }
+        if outstanding.fetch_sub(1, Ordering::AcqRel) != 1 {
+            // there are outstanding references left, so we can't free the id yet.
 
-                    // signal that there is no more manual cleanup required for future threads that get assigned this
-                    // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
-                    // even though the entry is completely unused.
-                    self.guard.store(GUARD_EMPTY, Ordering::Release);
-                    return;
-                }
-            } else {
-                panic!("no outstanding refs!");
-            }
-            println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
             // signal that there is no more manual cleanup required for future threads that get assigned this
             // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
             // even though the entry is completely unused.
             self.guard.store(GUARD_EMPTY, Ordering::Release);
-
-            // the tid_manager is either an `alternative` id manager or the `global` tid manager.
-            unsafe { self.tid_manager.as_ref() }.lock().unwrap().free(self.id);
             return;
         }
-        self.guard.store(GUARD_ACTIVE_EXTERNAL | GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG, Ordering::Release);
+        println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
+        // signal that there is no more manual cleanup required for future threads that get assigned this
+        // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
+        // even though the entry is completely unused.
+        self.guard.store(GUARD_EMPTY, Ordering::Release);
+
+        // the tid_manager is either an `alternative` id manager or the `global` tid manager.
+        unsafe { self.tid_manager.as_ref() }.lock().unwrap().free(self.id);
     }
 
 }
@@ -565,7 +566,6 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
 
         // Insert the new element into the bucket
         let mut entry = unsafe { &*unsafe { bucket_ptr.add(thread.index) } };
-        let entry_ptr = entry as *const Entry<T, M, AUTO_FREE_IDS>;
 
         // check if the entry isn't cleaned up automatically
         if entry.guard.load(Ordering::Acquire) == GUARD_FREE_MANUALLY {

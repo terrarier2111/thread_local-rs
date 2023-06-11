@@ -939,12 +939,15 @@ impl<T> SizedBox<T> {
     fn new(val: T) -> Self {
         // SAFETY: The layout we provided was checked at compiletime, so it has to be initialized correctly
         let alloc = unsafe { alloc(Self::LAYOUT) }.cast::<T>();
+        if alloc.is_null() {
+            panic!("Out of memory!");
+        }
         // FIXME: add safety comment
         unsafe {
             alloc.write(val);
         }
         Self {
-            alloc_ptr: NonNull::new(alloc).unwrap(),
+            alloc_ptr: unsafe { NonNull::new_unchecked(alloc) },
         }
     }
 

@@ -338,18 +338,18 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
         // println!("set free manually id {} addr {:?}", slf.id, slf as *const Entry<T, M, AUTO_FREE_IDS>);
 
         if AUTO_FREE_IDS {
-            slf.guard.store(GUARD_EMPTY, Ordering::Release); // FIXME: is it okay to store GUARD_EMPTY even if there is still an alternative_entry present?
+            slf.guard.store(GUARD_EMPTY, Ordering::Release);
             return true;
         }
 
         // check if the destructor of the value destructed this entry, if not, simply return
         if (slf.guard.load(Ordering::Acquire) & GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG) == 0 {
-            slf.guard.store(GUARD_FREE_MANUALLY, Ordering::Release); // FIXME: is it okay to store GUARD_EMPTY even if there is still an alternative_entry present?
+            slf.guard.store(GUARD_FREE_MANUALLY, Ordering::Release);
             return false;
         }
 
         // signal that there is no more manual cleanup required for future threads that get assigned this
-        // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
+        // entry's id so they can use the actual entry and don't always fall back to a different entry
         // even though the entry is completely unused.
         slf.guard.store(GUARD_EMPTY, Ordering::Release);
 
@@ -375,14 +375,14 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
             // there are outstanding references left, so we can't free the id yet.
 
             // signal that there is no more manual cleanup required for future threads that get assigned this
-            // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
+            // entry's id so they can use the actual entry and don't always fall back to a different entry
             // even though the entry is completely unused.
             self.guard.store(GUARD_EMPTY, Ordering::Release);
             return;
         }
         // println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
         // signal that there is no more manual cleanup required for future threads that get assigned this
-        // entry's id so they can use the actual entry and don't always fall back to an alternative_entry
+        // entry's id so they can use the actual entry and don't always fall back to a different entry
         // even though the entry is completely unused.
         self.guard.store(GUARD_EMPTY, Ordering::Release);
 
@@ -484,7 +484,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         let mut buckets = [null_mut(); BUCKETS];
         let mut bucket_size = 1;
         for (i, bucket) in buckets[..allocated_buckets].iter_mut().enumerate() {
-            *bucket = allocate_bucket::<false, AUTO_FREE_IDS, T, M>(bucket_size, i);
+            *bucket = allocate_bucket::<AUTO_FREE_IDS, T, M>(bucket_size, i);
 
             bucket_size <<= 1;
         }
@@ -542,7 +542,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket::<false, AUTO_FREE_IDS, T, M>(thread.bucket_size(), thread.bucket);
+            let new_bucket = allocate_bucket::<AUTO_FREE_IDS, T, M>(thread.bucket_size(), thread.bucket);
 
             match bucket_atomic_ptr.compare_exchange(
                 null_mut(),
@@ -904,7 +904,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator for 
 
 impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> FusedIterator for IntoIter<T, M, AUTO_FREE_IDS> {}
 
-fn allocate_bucket<const ALTERNATIVE: bool, const AUTO_FREE_IDS: bool, T, M: Send + Sync + Default>(size: usize, bucket: usize) -> *mut Entry<T, M, AUTO_FREE_IDS> {
+fn allocate_bucket<const AUTO_FREE_IDS: bool, T, M: Send + Sync + Default>(size: usize, bucket: usize) -> *mut Entry<T, M, AUTO_FREE_IDS> {
     Box::into_raw(
         (0..size)
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {

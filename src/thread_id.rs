@@ -11,6 +11,7 @@ use crate::{BUCKETS, Entry, POINTER_WIDTH};
 use once_cell::sync::Lazy;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -110,29 +111,52 @@ pub(crate) unsafe fn shared_id_ptr(id: usize) -> *const AtomicUsize {
 }
 
 #[derive(Clone)]
-pub(crate) struct PtrCell<T>(Cell<usize>, PhantomData<T>);
+#[repr(transparent)]
+pub(crate) struct PtrCell<T>(Cell<*const T>);
 
 impl<T> PtrCell<T> {
 
     #[inline]
     pub(crate) fn new(val: *const T) -> Self {
-        Self(Cell::new(val as usize), PhantomData)
+        Self(Cell::new(val))
     }
 
     #[inline]
     pub(crate) fn set(&self, val: *const T) {
-        self.0.set(val as usize);
+        self.0.set(val);
     }
 
     #[inline]
     pub(crate) fn get(&self) -> *const T {
-        self.0.get() as *const T
+        self.0.get()
     }
 
 }
 
 unsafe impl<T: Send> Send for PtrCell<T> {}
 unsafe impl<T: Sync> Sync for PtrCell<T> {}
+
+#[repr(transparent)]
+pub(crate) struct SendSyncPtr<T>(pub *const T);
+
+unsafe impl<T: Send> Send for SendSyncPtr<T> {}
+unsafe impl<T: Sync> Sync for SendSyncPtr<T> {}
+
+impl<T> PartialEq<Self> for SendSyncPtr<T> {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq(&other.0)
+    }
+}
+
+impl<T> Eq for SendSyncPtr<T> {}
+
+impl<T> Hash for SendSyncPtr<T> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_usize(self.0 as usize);
+    }
+}
 
 /// Data which is unique to the current thread while it is running.
 /// A thread ID may be reused after a thread exits.
@@ -182,7 +206,7 @@ pub(crate) fn free_id(id: usize) {
 pub(crate) struct FreeList {
     id: usize,
     pub(crate) dropping: AtomicBool,
-    pub(crate) free_list: Mutex<FxHashMap<usize, EntryData>>,
+    pub(crate) free_list: Mutex<FxHashMap<SendSyncPtr<Entry<()>>, EntryData>>,
 }
 
 impl FreeList {
@@ -202,7 +226,7 @@ impl FreeList {
         let mut outstanding = 0;
         for entry in free_list.unwrap().iter() {
             // sum up all the "failed" cleanups
-            if unsafe { !entry.1.cleanup(*entry.0 as *const Entry<()>) } {
+            if unsafe { !entry.1.cleanup(entry.0.0) } {
                 outstanding += 1;
             }
         }

@@ -69,9 +69,11 @@
 #![warn(missing_docs)]
 #![allow(clippy::mutex_atomic)]
 #![feature(thread_local)]
+#![feature(core_intrinsics)]
 
 mod thread_id;
 mod unreachable;
+mod mutex;
 
 use std::alloc::{alloc, dealloc, Layout};
 use crate::thread_id::{EntryData, free_id, FreeList, SendSyncPtr, shared_id_ptr, Thread, ThreadIdManager};
@@ -88,7 +90,6 @@ use std::panic::UnwindSafe;
 use std::ptr;
 use std::ptr::{null_mut, NonNull, null};
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 // Use usize::BITS once it has stabilized and the MSRV has been bumped.
 #[cfg(target_pointer_width = "16")]
@@ -291,12 +292,12 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
         let backoff = Backoff::new();
         loop {
             match unsafe { &*free_list }.free_list.try_lock() {
-                Ok(mut guard) => {
+                Some(mut guard) => {
                     // we got the lock and can now remove our entry from the free list
                     guard.remove(&SendSyncPtr(self as *const Entry<T, M, AUTO_FREE_IDS> as *const Entry<()>));
                     return true;
                 }
-                Err(_) => {
+                None => {
                     // check if the thread declared that it was dropping, if so give up.
                     if unsafe { &*free_list }.dropping.load(Ordering::Acquire) {
                         self.guard.store(GUARD_READY, Ordering::Release);
@@ -496,6 +497,21 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         }
     }
 
+    /// Like `get_or` but expects failure.
+    pub fn get_failing<F, MF>(&self, create: F, meta: MF) -> EntryToken<'_, RefAccess, T, M, AUTO_FREE_IDS>
+        where
+            F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T,
+            MF: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>),
+    {
+        let thread = thread_id::get();
+        if let Some(val) = self.get_inner(thread) {
+            return val;
+        }
+
+        // println!("failed fetching entry of: {}", thread.id);
+        self.insert(create, meta)
+    }
+
     /// Returns the element for the current thread, if it exists.
     pub fn get(&self) -> Option<EntryToken<RefAccess, T, M, AUTO_FREE_IDS>> {
         self.get_inner(thread_id::get())
@@ -514,7 +530,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         }
 
         // println!("failed fetching entry of: {}", thread.id);
-        self.insert(create, meta)
+        self.insert_cold(create, meta)
     }
 
     fn get_inner(&self, thread: Thread) -> Option<EntryToken<'_, RefAccess, T, M, AUTO_FREE_IDS>> {
@@ -535,6 +551,12 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
     }
 
     #[cold]
+    #[inline(never)]
+    fn insert_cold<F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T, FM: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>)>(&self, f: F, fm: FM) -> EntryToken<RefAccess, T, M, AUTO_FREE_IDS> {
+        self.insert(f, fm)
+    }
+
+    #[inline]
     fn insert<F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T, FM: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>)>(&self, f: F, fm: FM) -> EntryToken<RefAccess, T, M, AUTO_FREE_IDS> {
         let thread = thread_id::get();
         let bucket_atomic_ptr = unsafe { self.buckets.get_unchecked(thread.bucket) };
@@ -581,7 +603,6 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         unsafe { thread.free_list.as_ref().unwrap_unchecked() }
             .free_list
             .lock()
-            .unwrap()
             .insert(
                 SendSyncPtr(entry as *const Entry<T, M, AUTO_FREE_IDS> as *const Entry<()>),
                 EntryData {

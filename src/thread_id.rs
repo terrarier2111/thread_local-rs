@@ -14,12 +14,14 @@ use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::mem;
 use std::mem::{ManuallyDrop, transmute};
 use std::ops::Deref;
 use std::ptr::{NonNull, null};
 use rustc_hash::{FxHasher, FxHashMap};
+use crate::mutex::Mutex;
+
+// FIXME: do the mutexes actually experience low contention or should a mutex implementation that expects more contention be chosen instead?
 
 /// Thread ID manager which allocates thread IDs. It attempts to aggressively
 /// reuse thread IDs where possible to avoid cases where a ThreadLocal grows
@@ -200,7 +202,7 @@ pub(crate) fn id_into_parts(id: usize) -> (usize, usize, usize) {
 
 #[inline]
 pub(crate) fn free_id(id: usize) {
-    THREAD_ID_MANAGER.lock().unwrap().free(id);
+    THREAD_ID_MANAGER.lock().free(id);
 }
 
 pub(crate) struct FreeList {
@@ -224,7 +226,7 @@ impl FreeList {
         // println!("alloced shared counter!");
         let outstanding_shared = unsafe { shared_id_ptr(self.id) };
         let mut outstanding = 0;
-        for entry in free_list.unwrap().iter() {
+        for entry in free_list.iter() {
             // sum up all the "failed" cleanups
             if unsafe { !entry.1.cleanup(entry.0.0) } {
                 outstanding += 1;
@@ -240,7 +242,7 @@ impl FreeList {
             // Release the thread ID. Any further accesses to the thread ID
             // will go through get_slow which will either panic or
             // initialize a new ThreadGuard.
-            THREAD_ID_MANAGER.lock().unwrap().free(self.id);
+            THREAD_ID_MANAGER.lock().free(self.id);
         }
     }
 }
@@ -295,7 +297,7 @@ pub(crate) fn get() -> Thread {
 /// Out-of-line slow path for allocating a thread ID.
 #[cold]
 fn get_slow() -> Thread {
-    let tid = THREAD_ID_MANAGER.lock().unwrap().alloc();
+    let tid = THREAD_ID_MANAGER.lock().alloc();
     unsafe {
         FREE_LIST = Some(ManuallyDrop::new(FreeList::new(tid)));
     }

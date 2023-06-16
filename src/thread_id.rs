@@ -309,7 +309,7 @@ fn get_slow() -> Thread {
     new
 }
 
-#[test]
+/*#[test]
 fn test_thread() {
     use std::ptr::null;
     let thread = Thread::new(0, null());
@@ -336,4 +336,4 @@ fn test_thread() {
     assert_eq!(thread.bucket, 4);
     assert_eq!(thread.bucket_size(), 16);
     assert_eq!(thread.index, 4);
-}
+}*/

@@ -588,12 +588,6 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         // Insert the new element into the bucket
         let mut entry = unsafe { &*unsafe { bucket_ptr.add(thread.index) } };
 
-        // check if the entry isn't cleaned up automatically
-        if entry.guard.load(Ordering::Acquire) == GUARD_FREE_MANUALLY {
-            // println!("to be freed entry: freelist {:?} id {} tid_manager: {:?}", entry.free_list.load(Ordering::Acquire), entry.id, entry.tid_manager);
-            panic!("found entry which should have been manually freed!");
-        }
-
         let value_ptr = entry.value.get();
         unsafe { value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()))))) };
         if size_of::<M>() > 0 {

@@ -479,7 +479,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
     pub fn new_insert<F, MF>(f: F, mf: MF) -> (ThreadLocal<T, M, AUTO_FREE_IDS>, UnsafeToken<T, M, AUTO_FREE_IDS>)
         where
             F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T,
-            MF: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>),
+            MF: FnOnce(EntryToken<MutRefAccess, T, M, AUTO_FREE_IDS>),
     {
         // detect the amount of capacity we need.
         let thread = thread_id::get();

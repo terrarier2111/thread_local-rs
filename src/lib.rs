@@ -483,23 +483,9 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
     {
         // detect the amount of capacity we need.
         let thread = thread_id::get();
+        let capacity = (1 << thread.bucket) as usize;
 
-        let mut ret = {
-            let bucket_cnt = thread.bucket + 1;
-            let mut buckets = [null_mut(); BUCKETS];
-            let mut bucket_size = 1;
-            for (i, bucket) in buckets[..bucket_cnt].iter_mut().enumerate() {
-                *bucket = allocate_bucket::<AUTO_FREE_IDS, T, M>(bucket_size, i);
-
-                bucket_size <<= 1;
-            }
-
-            Self {
-                // Safety: AtomicPtr has the same representation as a pointer and arrays have the same
-                // representation as a sequence of their inner type.
-                buckets: unsafe { transmute(buckets) },
-            }
-        };
+        let mut ret = Self::with_capacity(capacity);
 
         let ptr = *ret.buckets[thread.bucket].get_mut();
 

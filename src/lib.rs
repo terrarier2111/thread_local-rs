@@ -475,6 +475,48 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         Self::with_capacity(2)
     }
 
+    /// Creates a new empty `ThreadLocal`.
+    pub fn new_insert<F, MF>(f: F, mf: MF) -> (ThreadLocal<T, M, AUTO_FREE_IDS>, UnsafeToken<T, M, AUTO_FREE_IDS>)
+        where
+            F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T,
+            MF: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>),
+    {
+        // detect the amount of capacity we need.
+        let thread = thread_id::get();
+        let capacity = (1 << thread.bucket) as usize;
+
+        let mut ret = Self::with_capacity(capacity);
+
+        let ptr = *ret.buckets[thread.bucket].get_mut();
+
+        // Insert the new element into the bucket
+        let mut entry = unsafe { &*unsafe { ptr.add(thread.index) } };
+
+        let value_ptr = entry.value.get();
+        unsafe { value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()))))) };
+        if size_of::<M>() > 0 {
+            mf(EntryToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default()));
+        }
+        let cleanup_fn = Entry::<T, M, AUTO_FREE_IDS>::cleanup;
+        unsafe { thread.free_list.as_ref().unwrap_unchecked() }
+            .free_list
+            .lock()
+            .insert(
+                SendSyncPtr(entry as *const Entry<T, M, AUTO_FREE_IDS> as *const Entry<()>),
+                EntryData {
+                    drop_fn: unsafe { transmute(cleanup_fn as *const ()) },
+                },
+            );
+
+        let mut entry = unsafe { &mut *unsafe { ptr.add(thread.index) } };
+
+        *entry
+            .free_list.get_mut() = thread.free_list.cast_mut();
+        *entry.guard.get_mut() = GUARD_READY;
+
+        (ret, UnsafeToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }))
+    }
+
     /// Creates a new `ThreadLocal` with an initial capacity. If less than the capacity threads
     /// access the thread local it will never reallocate. The capacity may be rounded up to the
     /// nearest power of two.
@@ -497,21 +539,6 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         }
     }
 
-    /// Like `get_or` but expects failure.
-    pub fn get_failing<F, MF>(&self, create: F, meta: MF) -> EntryToken<'_, RefAccess, T, M, AUTO_FREE_IDS>
-        where
-            F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T,
-            MF: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>),
-    {
-        let thread = thread_id::get();
-        if let Some(val) = self.get_inner(thread) {
-            return val;
-        }
-
-        // println!("failed fetching entry of: {}", thread.id);
-        self.insert(create, meta)
-    }
-
     /// Returns the element for the current thread, if it exists.
     pub fn get(&self) -> Option<EntryToken<RefAccess, T, M, AUTO_FREE_IDS>> {
         self.get_inner(thread_id::get())
@@ -530,7 +557,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         }
 
         // println!("failed fetching entry of: {}", thread.id);
-        self.insert_cold(create, meta)
+        self.insert(create, meta)
     }
 
     fn get_inner(&self, thread: Thread) -> Option<EntryToken<'_, RefAccess, T, M, AUTO_FREE_IDS>> {
@@ -552,11 +579,6 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
 
     #[cold]
     #[inline(never)]
-    fn insert_cold<F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T, FM: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>)>(&self, f: F, fm: FM) -> EntryToken<RefAccess, T, M, AUTO_FREE_IDS> {
-        self.insert(f, fm)
-    }
-
-    #[inline]
     fn insert<F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T, FM: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>)>(&self, f: F, fm: FM) -> EntryToken<RefAccess, T, M, AUTO_FREE_IDS> {
         let thread = thread_id::get();
         let bucket_atomic_ptr = unsafe { self.buckets.get_unchecked(thread.bucket) };

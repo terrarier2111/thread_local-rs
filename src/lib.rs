@@ -942,7 +942,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator for 
 impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> FusedIterator for IntoIter<T, M, AUTO_FREE_IDS> {}
 
 fn allocate_bucket<const AUTO_FREE_IDS: bool, T, M: Send + Sync + Default>(size: usize, bucket: usize) -> *mut Entry<T, M, AUTO_FREE_IDS> {
-    Box::into_raw(
+    /*Box::into_raw(
         (0..size)
             .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
                 aligned: Default::default(),
@@ -957,7 +957,23 @@ fn allocate_bucket<const AUTO_FREE_IDS: bool, T, M: Send + Sync + Default>(size:
                 value: UnsafeCell::new(MaybeUninit::uninit()),
             })
             .collect(),
-    ) as *mut _
+    ) as *mut _*/
+    let alloc = unsafe { alloc(Layout::array::<Entry::<T, M, AUTO_FREE_IDS>>(size).unwrap()) }.cast::<Entry::<T, M, AUTO_FREE_IDS>>();
+    for n in 0..size {
+        unsafe { alloc.offset(n as isize).write(Entry::<T, M, AUTO_FREE_IDS> {
+            aligned: Default::default(),
+            id: {
+                // println!("calced id: {}[{}]: {}", bucket, n, (1 << bucket) - 1 + n);
+                // we need to offset all entries by the number of all entries of previous buckets.
+                (1 << bucket) - 1 + n
+            },
+            guard: AtomicUsize::new(GUARD_UNINIT),
+            free_list: Default::default(),
+            meta: Default::default(),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }); }
+    }
+    alloc
 }
 
 unsafe fn deallocate_bucket<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>(bucket: *mut Entry<T, M, AUTO_FREE_IDS>, size: usize) {

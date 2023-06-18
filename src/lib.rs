@@ -483,9 +483,23 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
     {
         // detect the amount of capacity we need.
         let thread = thread_id::get();
-        let capacity = (1 << thread.bucket) as usize;
 
-        let mut ret = Self::with_capacity(capacity);
+        let mut ret = {
+            let bucket_cnt = thread.bucket + 1;
+            let mut buckets = [null_mut(); BUCKETS];
+            let mut bucket_size = 1;
+            for (i, bucket) in buckets[..bucket_cnt].iter_mut().enumerate() {
+                *bucket = allocate_bucket::<AUTO_FREE_IDS, T, M>(bucket_size, i);
+
+                bucket_size <<= 1;
+            }
+
+            Self {
+                // Safety: AtomicPtr has the same representation as a pointer and arrays have the same
+                // representation as a sequence of their inner type.
+                buckets: unsafe { transmute(buckets) },
+            }
+        };
 
         let ptr = *ret.buckets[thread.bucket].get_mut();
 
@@ -942,22 +956,6 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator for 
 impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> FusedIterator for IntoIter<T, M, AUTO_FREE_IDS> {}
 
 fn allocate_bucket<const AUTO_FREE_IDS: bool, T, M: Send + Sync + Default>(size: usize, bucket: usize) -> *mut Entry<T, M, AUTO_FREE_IDS> {
-    /*Box::into_raw(
-        (0..size)
-            .map(|n| Entry::<T, M, AUTO_FREE_IDS> {
-                aligned: Default::default(),
-                id: {
-                    // println!("calced id: {}[{}]: {}", bucket, n, (1 << bucket) - 1 + n);
-                    // we need to offset all entries by the number of all entries of previous buckets.
-                    (1 << bucket) - 1 + n
-                },
-                guard: AtomicUsize::new(GUARD_UNINIT),
-                free_list: Default::default(),
-                meta: Default::default(),
-                value: UnsafeCell::new(MaybeUninit::uninit()),
-            })
-            .collect(),
-    ) as *mut _*/
     let alloc = unsafe { alloc(Layout::array::<Entry::<T, M, AUTO_FREE_IDS>>(size).unwrap()) }.cast::<Entry::<T, M, AUTO_FREE_IDS>>();
     for n in 0..size {
         unsafe { alloc.offset(n as isize).write(Entry::<T, M, AUTO_FREE_IDS> {

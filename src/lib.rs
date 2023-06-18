@@ -464,7 +464,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Thre
                 break;
             }
 
-            unsafe { deallocate_bucket(bucket_ptr, this_bucket_size) };
+            unsafe { deallocate_bucket(NonNull::new_unchecked(bucket_ptr), this_bucket_size) };
         }
     }
 }
@@ -525,11 +525,9 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         // println!("allocated buckets: {}", allocated_buckets);
 
         let mut buckets = [null_mut(); BUCKETS];
-        let mut bucket_size = 1;
         for (i, bucket) in buckets[..allocated_buckets].iter_mut().enumerate() {
+            let bucket_size = 1 << i;
             *bucket = allocate_bucket::<AUTO_FREE_IDS, T, M>(bucket_size, i);
-
-            bucket_size <<= 1;
         }
 
         Self {
@@ -599,7 +597,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
                 // another thread stored a new bucket before we could,
                 // and we can free our bucket and use that one instead
                 Err(bucket_ptr) => {
-                    unsafe { deallocate_bucket(new_bucket, thread.bucket_size()) }
+                    unsafe { deallocate_bucket(NonNull::new_unchecked(new_bucket), thread.bucket_size()) }
                     bucket_ptr
                 }
             }
@@ -960,8 +958,8 @@ fn allocate_bucket<const AUTO_FREE_IDS: bool, T, M: Send + Sync + Default>(size:
     alloc
 }
 
-unsafe fn deallocate_bucket<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>(bucket: *mut Entry<T, M, AUTO_FREE_IDS>, size: usize) {
-    let _ = Box::from_raw(std::slice::from_raw_parts_mut(bucket, size));
+unsafe fn deallocate_bucket<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>(bucket: NonNull<Entry<T, M, AUTO_FREE_IDS>>, size: usize) {
+    let _ = Box::from_raw(std::slice::from_raw_parts_mut(bucket.as_ptr(), size));
 }
 
 struct SizedBox<T> {

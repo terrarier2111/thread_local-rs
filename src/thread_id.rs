@@ -54,13 +54,9 @@ impl ThreadIdManager {
         let id = self.free_from;
         self.free_from += 1;
 
-        if id % 2 == 0 {
-            if id == 0 {
-                SHARED_IDS[0].set(alloc_shared(1));
-            }
+        if (id + 1).is_power_of_two() {
+            let (bucket, bucket_size, _) = id_into_parts(id);
 
-            let bucket = POINTER_WIDTH as usize - id.leading_zeros() as usize + 1;
-            let bucket_size = 1 << bucket;
             SHARED_IDS[bucket].set(alloc_shared(bucket_size));
         }
 

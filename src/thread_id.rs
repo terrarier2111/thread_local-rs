@@ -5,20 +5,17 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use std::alloc::{alloc, alloc_zeroed, dealloc, Layout};
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cell::Cell;
 use crate::{BUCKETS, Entry, POINTER_WIDTH};
-use once_cell::sync::Lazy;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::mem;
 use std::mem::{ManuallyDrop, transmute};
 use std::ops::Deref;
-use std::ptr::{NonNull, null};
-use rustc_hash::{FxHasher, FxHashMap};
+use std::ptr::null;
+use rustc_hash::FxHashMap;
 use crate::mutex::Mutex;
 
 // FIXME: do the mutexes actually experience low contention or should a mutex implementation that expects more contention be chosen instead?
@@ -41,7 +38,6 @@ impl ThreadIdManager {
 
     pub(crate) fn alloc(&mut self) -> usize {
         if let Some(id) = self.free_list.pop() {
-            // println!("alloced tid: {}", id.0);
             return id.0;
         }
 
@@ -60,18 +56,10 @@ impl ThreadIdManager {
             SHARED_IDS[bucket].set(alloc_shared(bucket_size));
         }
 
-        // println!("alloced tid: {}", id);
         id
     }
 
     pub(crate) fn free(&mut self, id: usize) {
-        /*if self.free_list.iter().find(|x| x.0 == id).is_some() {
-            panic!("double freed tid!");
-        }
-        if self.free_from <= id {
-            panic!("freed tid although tid was never handed out {} max {} glob {:?} local {:?}", id, self.free_from, global_tid_manager(), self as *const ThreadIdManager);
-        }*/
-
         self.free_list.push(Reverse(id));
     }
 
@@ -84,7 +72,6 @@ impl Drop for ThreadIdManager {
             let ptr = SHARED_IDS[bucket].get().cast_mut();
             unsafe { dealloc(ptr.cast(), Layout::array::<AtomicUsize>(1 << bucket).unwrap_unchecked()); }
         }
-        println!("dealloced!");
     }
 }
 
@@ -219,7 +206,6 @@ impl FreeList {
     fn cleanup(&self) {
         self.dropping.store(true, Ordering::Release);
         let free_list = self.free_list.lock();
-        // println!("alloced shared counter!");
         let outstanding_shared = unsafe { shared_id_ptr(self.id) };
         let mut outstanding = 0;
         for entry in free_list.iter() {
@@ -307,7 +293,7 @@ fn get_slow() -> Thread {
     new
 }
 
-/*#[test]
+#[test]
 fn test_thread() {
     use std::ptr::null;
     let thread = Thread::new(0, null());
@@ -334,4 +320,4 @@ fn test_thread() {
     assert_eq!(thread.bucket, 4);
     assert_eq!(thread.bucket_size(), 16);
     assert_eq!(thread.index, 4);
-}*/
+}

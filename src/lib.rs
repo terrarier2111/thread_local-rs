@@ -245,7 +245,7 @@ pub struct RefAccess;
 
 // FIXME: should we primarily determine whether an entry is empty via the free_list ptr or the guard value?
 struct Entry<T, M: Send + Sync + Default = (), const AUTO_FREE_IDS: bool = true> {
-    aligned: CachePadded<()>,
+    _aligned: CachePadded<()>,
     id: usize,
     guard: AtomicUsize,
     free_list: AtomicPtr<FreeList>,
@@ -937,7 +937,7 @@ fn allocate_bucket<const AUTO_FREE_IDS: bool, T, M: Send + Sync + Default>(size:
     let alloc = unsafe { alloc(Layout::array::<Entry::<T, M, AUTO_FREE_IDS>>(size).unwrap()) }.cast::<Entry::<T, M, AUTO_FREE_IDS>>();
     for n in 0..size {
         unsafe { alloc.offset(n as isize).write(Entry::<T, M, AUTO_FREE_IDS> {
-            aligned: Default::default(),
+            _aligned: Default::default(),
             id: {
                 // we need to offset all entries by the number of all entries of previous buckets.
                 (1 << bucket) - 1 + n

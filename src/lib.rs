@@ -76,7 +76,7 @@ mod unreachable;
 mod mutex;
 
 use std::alloc::{alloc, dealloc, Layout};
-use crate::thread_id::{EntryData, free_id, FreeList, SendSyncPtr, shared_id_ptr, Thread, ThreadIdManager};
+use crate::thread_id::{EntryData, free_id, FreeList, SendSyncPtr, shared_id_ptr, Thread};
 use crossbeam_utils::{Backoff, CachePadded};
 use smallvec::{smallvec, SmallVec};
 use std::cell::UnsafeCell;
@@ -85,7 +85,6 @@ use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::mem;
 use std::mem::{size_of, transmute, MaybeUninit};
-use std::ops::Deref;
 use std::panic::UnwindSafe;
 use std::ptr;
 use std::ptr::{null_mut, NonNull, null};
@@ -336,7 +335,6 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
         // this also disables the cleanup of this entry in the `normal` entry
         // on destruction of the central struct.
         slf.free_list.store(null_mut(), Ordering::Release);
-        // println!("set free manually id {} addr {:?}", slf.id, slf as *const Entry<T, M, AUTO_FREE_IDS>);
 
         if AUTO_FREE_IDS {
             slf.guard.store(GUARD_EMPTY, Ordering::Release);
@@ -364,7 +362,6 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
             self.guard.store(GUARD_ACTIVE_EXTERNAL | GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG, Ordering::Release);
             return;
         }
-        // println!("free_id call {}", self.id);
         // check if we are a "main" entry and our thread is finished
         let outstanding = shared_id_ptr(self.id).as_ref().unwrap_unchecked();
         let backoff = Backoff::new();
@@ -381,7 +378,6 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
             self.guard.store(GUARD_EMPTY, Ordering::Release);
             return;
         }
-        // println!("freeeeeeeing {} in {:?} glob {:?}", self.id, self.tid_manager, global_tid_manager());
         // signal that there is no more manual cleanup required for future threads that get assigned this
         // entry's id so they can use the actual entry and don't always fall back to a different entry
         // even though the entry is completely unused.
@@ -490,7 +486,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         let ptr = *ret.buckets[thread.bucket].get_mut();
 
         // Insert the new element into the bucket
-        let mut entry = unsafe { &*unsafe { ptr.add(thread.index) } };
+        let entry = unsafe { &*ptr.add(thread.index) };
 
         let value_ptr = entry.value.get();
         unsafe { value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()))))) };
@@ -508,7 +504,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
                 },
             );
 
-        let mut entry = unsafe { &mut *unsafe { ptr.add(thread.index) } };
+        let entry = unsafe { &mut *ptr.add(thread.index) };
 
         *entry
             .free_list.get_mut() = thread.free_list.cast_mut();
@@ -522,7 +518,6 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
     /// nearest power of two.
     pub fn with_capacity(capacity: usize) -> ThreadLocal<T, M, AUTO_FREE_IDS> {
         let allocated_buckets = usize::from(POINTER_WIDTH) - (capacity.leading_zeros() as usize);
-        // println!("allocated buckets: {}", allocated_buckets);
 
         let mut buckets = [null_mut(); BUCKETS];
         for (i, bucket) in buckets[..allocated_buckets].iter_mut().enumerate() {
@@ -554,7 +549,6 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
             return val;
         }
 
-        // println!("failed fetching entry of: {}", thread.id);
         self.insert(create, meta)
     }
 
@@ -564,9 +558,9 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         if bucket_ptr.is_null() {
             return None;
         }
-        let mut entry_ptr = unsafe { bucket_ptr.add(thread.index) };
-        let mut entry = unsafe { &*entry_ptr };
-        let mut free_list = entry.free_list.load(Ordering::Acquire);
+        let entry_ptr = unsafe { bucket_ptr.add(thread.index) };
+        let entry = unsafe { &*entry_ptr };
+        let free_list = entry.free_list.load(Ordering::Acquire);
 
         if free_list.is_null() {
             return None;
@@ -606,7 +600,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         };
 
         // Insert the new element into the bucket
-        let mut entry = unsafe { &*unsafe { bucket_ptr.add(thread.index) } };
+        let entry = unsafe { &*bucket_ptr.add(thread.index) };
 
         let value_ptr = entry.value.get();
         unsafe { value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()))))) };
@@ -766,7 +760,7 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
                         }
                         Err(guard) => {
                             if guard == GUARD_UNINIT {
-                                return None;
+                                break;
                             }
                             if guard != GUARD_ACTIVE_ITERATOR {
                                 break;
@@ -808,7 +802,7 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
                     }
                     Err(guard) => {
                         if guard == GUARD_UNINIT {
-                            return None;
+                            continue;
                         }
                     }
                 }
@@ -945,7 +939,6 @@ fn allocate_bucket<const AUTO_FREE_IDS: bool, T, M: Send + Sync + Default>(size:
         unsafe { alloc.offset(n as isize).write(Entry::<T, M, AUTO_FREE_IDS> {
             aligned: Default::default(),
             id: {
-                // println!("calced id: {}[{}]: {}", bucket, n, (1 << bucket) - 1 + n);
                 // we need to offset all entries by the number of all entries of previous buckets.
                 (1 << bucket) - 1 + n
             },
@@ -1045,7 +1038,7 @@ mod tests {
         Arc::new(move || count.fetch_add(1, Relaxed))
     }
 
-    /*#[test]
+    #[test]
     fn same_thread() {
         let create = make_create();
         let mut tls: ThreadLocal<usize, ()> = ThreadLocal::new();
@@ -1063,7 +1056,7 @@ mod tests {
         assert_eq!("ThreadLocal { local_data: Some(0) }", format!("{:?}", &tls));
         tls.clear();
         assert_eq!(None, tls.get().map(|entry| *entry.value()));
-    }*/
+    }
 
     #[test]
     fn different_thread() {
@@ -1093,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn iter() { // FIXME: fix this test!
+    fn iter() {
         let tls = Arc::new(ThreadLocal::<Box<i32>, ()>::new());
         tls.get_or(|_| Box::new(1), |_| {});
 
@@ -1123,16 +1116,16 @@ mod tests {
         v.sort_unstable();
         assert_eq!(vec![1], v);
 
-        /*let mut v = tls.iter_mut().map(|x| **x.value()).collect::<Vec<i32>>();
+        let mut v = tls.iter_mut().map(|x| **x.value()).collect::<Vec<i32>>();
         v.sort_unstable();
-        assert_eq!(vec![1], v);*/
+        assert_eq!(vec![1], v);
 
-        /*let mut v = tls.into_iter().map(|x| *x).collect::<Vec<i32>>();
+        let mut v = tls.into_iter().map(|x| *x).collect::<Vec<i32>>();
         v.sort_unstable();
-        assert_eq!(vec![1], v);*/
+        assert_eq!(vec![1], v);
     }
 
-    /*#[test]
+    #[test]
     fn test_drop() {
         let local: ThreadLocal<Dropped, ()> = ThreadLocal::new();
         struct Dropped(Arc<AtomicUsize>);
@@ -1147,12 +1140,12 @@ mod tests {
         assert_eq!(dropped.load(Relaxed), 0);
         drop(local);
         assert_eq!(dropped.load(Relaxed), 1);
-    }*/
+    }
 
-    /*#[test]
+    #[test]
     fn is_sync() {
         fn foo<T: Sync>() {}
         foo::<ThreadLocal<String>>();
         foo::<ThreadLocal<RefCell<String>>>();
-    }*/
+    }
 }

@@ -71,14 +71,14 @@
 #![feature(thread_local)]
 #![feature(core_intrinsics)]
 
+mod mutex;
 mod thread_id;
 mod unreachable;
-mod mutex;
 
-use std::alloc::{alloc, dealloc, Layout};
-use crate::thread_id::{EntryData, free_id, FreeList, SendSyncPtr, shared_id_ptr, Thread};
+use crate::thread_id::{free_id, shared_id_ptr, EntryData, FreeList, SendSyncPtr, Thread};
 use crossbeam_utils::{Backoff, CachePadded};
 use smallvec::{smallvec, SmallVec};
+use std::alloc::{alloc, dealloc, Layout};
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::iter::FusedIterator;
@@ -87,7 +87,7 @@ use std::mem;
 use std::mem::{size_of, transmute, MaybeUninit};
 use std::panic::UnwindSafe;
 use std::ptr;
-use std::ptr::{null_mut, NonNull, null};
+use std::ptr::{null, null_mut, NonNull};
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 // Use usize::BITS once it has stabilized and the MSRV has been bumped.
@@ -136,10 +136,11 @@ fn is_active_external<const AUTO_FREE_IDS: bool>(guard: usize) -> bool {
 }
 
 #[derive(Clone)]
-pub struct UnsafeToken<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>(NonNull<Entry<T, M, AUTO_FREE_IDS>>);
+pub struct UnsafeToken<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>(
+    NonNull<Entry<T, M, AUTO_FREE_IDS>>,
+);
 
 impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> UnsafeToken<T, M, AUTO_FREE_IDS> {
-
     /// This is `MaybeUninit<T>` instead of `T` because when `UnsafeToken` is handed out
     /// in the first closure of`get_or` the value is still uninitialized.
     /// Furthermore this token may outlive the Entry it corresponds to and as
@@ -176,24 +177,30 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> UnsafeToken<T, M, A
     pub fn duplicate(&self) -> Self {
         Self(self.0.clone())
     }
-
 }
 
 impl<T, M: Send + Sync + Default> UnsafeToken<T, M, false> {
-
     /// SAFETY: This may only be called after the thread associated with this thread local got terminated
     /// or inside the destructor of the value contained within the Entry.
     pub unsafe fn destruct(self) {
-        unsafe { self.0.as_ref().free_id(); }
+        unsafe {
+            self.0.as_ref().free_id();
+        }
     }
-
 }
 
 #[derive(PartialEq)]
-pub struct EntryToken<'a, ACCESS, T, M: Send + Sync + Default = (), const AUTO_FREE_IDS: bool = true>(NonNull<Entry<T, M, AUTO_FREE_IDS>>, PhantomData<&'a ACCESS>);
+pub struct EntryToken<
+    'a,
+    ACCESS,
+    T,
+    M: Send + Sync + Default = (),
+    const AUTO_FREE_IDS: bool = true,
+>(NonNull<Entry<T, M, AUTO_FREE_IDS>>, PhantomData<&'a ACCESS>);
 
-impl<'a, ACCESS, T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> EntryToken<'a, ACCESS, T, M, AUTO_FREE_IDS> {
-
+impl<'a, ACCESS, T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>
+    EntryToken<'a, ACCESS, T, M, AUTO_FREE_IDS>
+{
     #[inline]
     pub fn value(&self) -> &T {
         unsafe { (&*self.0.as_ref().value.get()).assume_init_ref() }
@@ -208,36 +215,40 @@ impl<'a, ACCESS, T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> EntryTo
     pub fn into_unsafe_token(self) -> UnsafeToken<T, M, AUTO_FREE_IDS> {
         UnsafeToken(self.0)
     }
-
 }
 
 impl<'a, ACCESS, T, M: Send + Sync + Default> EntryToken<'a, ACCESS, T, M, false> {
-
     /// SAFETY: This may only be called after the thread associated with this thread local got terminated
     /// or inside the destructor of the value contained within the Entry.
     pub unsafe fn destruct(self) {
-        unsafe { self.0.as_ref().free_id(); }
+        unsafe {
+            self.0.as_ref().free_id();
+        }
     }
-
 }
 
-impl<'a, T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> EntryToken<'a, MutRefAccess, T, M, AUTO_FREE_IDS> {
-
+impl<'a, T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>
+    EntryToken<'a, MutRefAccess, T, M, AUTO_FREE_IDS>
+{
     #[inline]
     pub fn value_mut(&mut self) -> &mut T {
         unsafe { (&mut *self.0.as_ref().value.get()).assume_init_mut() }
     }
-
 }
 
-impl<'a, T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Clone for EntryToken<'a, RefAccess, T, M, AUTO_FREE_IDS> {
+impl<'a, T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Clone
+    for EntryToken<'a, RefAccess, T, M, AUTO_FREE_IDS>
+{
     #[inline]
     fn clone(&self) -> Self {
         Self(self.0.clone(), PhantomData::default())
     }
 }
 
-impl<'a, T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Copy for EntryToken<'a, RefAccess, T, M, AUTO_FREE_IDS> {}
+impl<'a, T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Copy
+    for EntryToken<'a, RefAccess, T, M, AUTO_FREE_IDS>
+{
+}
 
 pub struct MutRefAccess;
 
@@ -293,7 +304,9 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
             match unsafe { &*free_list }.free_list.try_lock() {
                 Some(mut guard) => {
                     // we got the lock and can now remove our entry from the free list
-                    guard.remove(&SendSyncPtr(self as *const Entry<T, M, AUTO_FREE_IDS> as *const Entry<()>));
+                    guard.remove(&SendSyncPtr(
+                        self as *const Entry<T, M, AUTO_FREE_IDS> as *const Entry<()>,
+                    ));
                     return true;
                 }
                 None => {
@@ -359,7 +372,10 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
     /// SAFETY: This may only be called after the thread associated with this thread local has finished.
     unsafe fn free_id(&self) {
         if self.guard.load(Ordering::Acquire) == GUARD_ACTIVE_EXTERNAL {
-            self.guard.store(GUARD_ACTIVE_EXTERNAL | GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG, Ordering::Release);
+            self.guard.store(
+                GUARD_ACTIVE_EXTERNAL | GUARD_ACTIVE_EXTERNAL_DESTRUCTED_FLAG,
+                Ordering::Release,
+            );
             return;
         }
         // check if we are a "main" entry and our thread is finished
@@ -385,7 +401,6 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Entry<T, M, AUTO_FR
 
         free_id(self.id);
     }
-
 }
 
 impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Entry<T, M, AUTO_FREE_IDS> {
@@ -401,15 +416,22 @@ impl<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Entry<T, M
 }
 
 // ThreadLocal is always Sync, even if T isn't
-unsafe impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Sync for ThreadLocal<T, M, AUTO_FREE_IDS> {}
+unsafe impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Sync
+    for ThreadLocal<T, M, AUTO_FREE_IDS>
+{
+}
 
-impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Default for ThreadLocal<T, M, AUTO_FREE_IDS> {
+impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Default
+    for ThreadLocal<T, M, AUTO_FREE_IDS>
+{
     fn default() -> ThreadLocal<T, M, AUTO_FREE_IDS> {
         ThreadLocal::new()
     }
 }
 
-impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for ThreadLocal<T, M, AUTO_FREE_IDS> {
+impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop
+    for ThreadLocal<T, M, AUTO_FREE_IDS>
+{
     fn drop(&mut self) {
         let mut bucket_size = 1;
 
@@ -465,17 +487,25 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Thre
     }
 }
 
-impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T, M, AUTO_FREE_IDS> {
+impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>
+    ThreadLocal<T, M, AUTO_FREE_IDS>
+{
     /// Creates a new empty `ThreadLocal`.
     pub fn new() -> ThreadLocal<T, M, AUTO_FREE_IDS> {
         Self::with_capacity(2)
     }
 
     /// Creates a new empty `ThreadLocal`.
-    pub fn new_insert<F, MF>(f: F, mf: MF) -> (ThreadLocal<T, M, AUTO_FREE_IDS>, UnsafeToken<T, M, AUTO_FREE_IDS>)
-        where
-            F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T,
-            MF: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>),
+    pub fn new_insert<F, MF>(
+        f: F,
+        mf: MF,
+    ) -> (
+        ThreadLocal<T, M, AUTO_FREE_IDS>,
+        UnsafeToken<T, M, AUTO_FREE_IDS>,
+    )
+    where
+        F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T,
+        MF: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>),
     {
         // detect the amount of capacity we need.
         let thread = thread_id::get();
@@ -489,9 +519,18 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         let entry = unsafe { &*ptr.add(thread.index) };
 
         let value_ptr = entry.value.get();
-        unsafe { value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()))))) };
+        unsafe {
+            value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked(
+                (entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut(),
+            )))))
+        };
         if size_of::<M>() > 0 {
-            mf(EntryToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default()));
+            mf(EntryToken(
+                unsafe {
+                    NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut())
+                },
+                Default::default(),
+            ));
         }
         let cleanup_fn = Entry::<T, M, AUTO_FREE_IDS>::cleanup;
         unsafe { thread.free_list.as_ref().unwrap_unchecked() }
@@ -506,11 +545,15 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
 
         let entry = unsafe { &mut *ptr.add(thread.index) };
 
-        *entry
-            .free_list.get_mut() = thread.free_list.cast_mut();
+        *entry.free_list.get_mut() = thread.free_list.cast_mut();
         *entry.guard.get_mut() = GUARD_READY;
 
-        (ret, UnsafeToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }))
+        (
+            ret,
+            UnsafeToken(unsafe {
+                NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut())
+            }),
+        )
     }
 
     /// Creates a new `ThreadLocal` with an initial capacity. If less than the capacity threads
@@ -539,7 +582,11 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
 
     /// Returns the element for the current thread, or creates it if it doesn't
     /// exist.
-    pub fn get_or<F, MF>(&self, create: F, meta: MF) -> EntryToken<'_, RefAccess, T, M, AUTO_FREE_IDS>
+    pub fn get_or<F, MF>(
+        &self,
+        create: F,
+        meta: MF,
+    ) -> EntryToken<'_, RefAccess, T, M, AUTO_FREE_IDS>
     where
         F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T,
         MF: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>),
@@ -566,19 +613,30 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
             return None;
         }
 
-        Some(EntryToken(unsafe { NonNull::new_unchecked(entry_ptr) }, Default::default()))
+        Some(EntryToken(
+            unsafe { NonNull::new_unchecked(entry_ptr) },
+            Default::default(),
+        ))
     }
 
     #[cold]
     #[inline(never)]
-    fn insert<F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T, FM: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>)>(&self, f: F, fm: FM) -> EntryToken<RefAccess, T, M, AUTO_FREE_IDS> {
+    fn insert<
+        F: FnOnce(UnsafeToken<T, M, AUTO_FREE_IDS>) -> T,
+        FM: FnOnce(EntryToken<RefAccess, T, M, AUTO_FREE_IDS>),
+    >(
+        &self,
+        f: F,
+        fm: FM,
+    ) -> EntryToken<RefAccess, T, M, AUTO_FREE_IDS> {
         let thread = thread_id::get();
         let bucket_atomic_ptr = unsafe { self.buckets.get_unchecked(thread.bucket) };
         let bucket_ptr: *const _ = bucket_atomic_ptr.load(Ordering::Acquire);
 
         // If the bucket doesn't already exist, we need to allocate it
         let bucket_ptr = if bucket_ptr.is_null() {
-            let new_bucket = allocate_bucket::<AUTO_FREE_IDS, T, M>(thread.bucket_size(), thread.bucket);
+            let new_bucket =
+                allocate_bucket::<AUTO_FREE_IDS, T, M>(thread.bucket_size(), thread.bucket);
 
             match bucket_atomic_ptr.compare_exchange(
                 null_mut(),
@@ -591,7 +649,9 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
                 // another thread stored a new bucket before we could,
                 // and we can free our bucket and use that one instead
                 Err(bucket_ptr) => {
-                    unsafe { deallocate_bucket(NonNull::new_unchecked(new_bucket), thread.bucket_size()) }
+                    unsafe {
+                        deallocate_bucket(NonNull::new_unchecked(new_bucket), thread.bucket_size())
+                    }
                     bucket_ptr
                 }
             }
@@ -603,9 +663,18 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
         let entry = unsafe { &*bucket_ptr.add(thread.index) };
 
         let value_ptr = entry.value.get();
-        unsafe { value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()))))) };
+        unsafe {
+            value_ptr.write(MaybeUninit::new(f(UnsafeToken(NonNull::new_unchecked(
+                (entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut(),
+            )))))
+        };
         if size_of::<M>() > 0 {
-            fm(EntryToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default()));
+            fm(EntryToken(
+                unsafe {
+                    NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut())
+                },
+                Default::default(),
+            ));
         }
         let cleanup_fn = Entry::<T, M, AUTO_FREE_IDS>::cleanup;
         unsafe { thread.free_list.as_ref().unwrap_unchecked() }
@@ -622,7 +691,12 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
             .store(thread.free_list.cast_mut(), Ordering::Release);
         entry.guard.store(GUARD_READY, Ordering::Release);
 
-        EntryToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default())
+        EntryToken(
+            unsafe {
+                NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut())
+            },
+            Default::default(),
+        )
     }
 
     /// Returns an iterator over the local values of all threads in unspecified
@@ -665,7 +739,9 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T
     }
 }
 
-impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> IntoIterator for ThreadLocal<T, M, AUTO_FREE_IDS> {
+impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> IntoIterator
+    for ThreadLocal<T, M, AUTO_FREE_IDS>
+{
     type Item = T;
     type IntoIter = IntoIter<T, M, AUTO_FREE_IDS>;
 
@@ -677,7 +753,9 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> IntoIterator 
     }
 }
 
-impl<'a, T: Send + Sync, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> IntoIterator for &'a ThreadLocal<T, M, AUTO_FREE_IDS> {
+impl<'a, T: Send + Sync, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> IntoIterator
+    for &'a ThreadLocal<T, M, AUTO_FREE_IDS>
+{
     type Item = EntryToken<'a, RefAccess, T, M, AUTO_FREE_IDS>;
     type IntoIter = Iter<'a, T, M, AUTO_FREE_IDS>;
 
@@ -686,7 +764,9 @@ impl<'a, T: Send + Sync, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> In
     }
 }
 
-impl<'a, T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> IntoIterator for &'a mut ThreadLocal<T, M, AUTO_FREE_IDS> {
+impl<'a, T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> IntoIterator
+    for &'a mut ThreadLocal<T, M, AUTO_FREE_IDS>
+{
     type Item = EntryToken<'a, MutRefAccess, T, M, AUTO_FREE_IDS>;
     type IntoIter = IterMut<'a, T, M, AUTO_FREE_IDS>;
 
@@ -703,14 +783,23 @@ impl<T: Send + Default, const AUTO_FREE_IDS: bool> ThreadLocal<T, (), AUTO_FREE_
     }
 }
 
-impl<T: Send + fmt::Debug, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> fmt::Debug for ThreadLocal<T, M, AUTO_FREE_IDS> {
+impl<T: Send + fmt::Debug, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> fmt::Debug
+    for ThreadLocal<T, M, AUTO_FREE_IDS>
+{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let entry = self.get();
-        write!(f, "ThreadLocal {{ local_data: {:?} }}", entry.as_ref().map(|entry| entry.value()))
+        write!(
+            f,
+            "ThreadLocal {{ local_data: {:?} }}",
+            entry.as_ref().map(|entry| entry.value())
+        )
     }
 }
 
-impl<T: Send + UnwindSafe, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> UnwindSafe for ThreadLocal<T, M, AUTO_FREE_IDS> {}
+impl<T: Send + UnwindSafe, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> UnwindSafe
+    for ThreadLocal<T, M, AUTO_FREE_IDS>
+{
+}
 
 #[derive(Debug)]
 struct RawIter<const NEW_GUARD: usize> {
@@ -823,13 +912,16 @@ impl<const NEW_GUARD: usize> RawIter<NEW_GUARD> {
 
 /// Iterator over the contents of a `ThreadLocal`.
 #[derive(Debug)]
-pub struct Iter<'a, T: Send + Sync, M: Send + Sync + Default = (), const AUTO_FREE_IDS: bool = true> {
+pub struct Iter<'a, T: Send + Sync, M: Send + Sync + Default = (), const AUTO_FREE_IDS: bool = true>
+{
     thread_local: &'a ThreadLocal<T, M, AUTO_FREE_IDS>,
     raw: RawIter<GUARD_ACTIVE_ITERATOR>,
     prev: *const Entry<T, M, AUTO_FREE_IDS>,
 }
 
-impl<'a, T: Send + Sync, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator for Iter<'a, T, M, AUTO_FREE_IDS> {
+impl<'a, T: Send + Sync, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator
+    for Iter<'a, T, M, AUTO_FREE_IDS>
+{
     type Item = EntryToken<'a, RefAccess, T, M, AUTO_FREE_IDS>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -841,14 +933,24 @@ impl<'a, T: Send + Sync, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> It
         self.raw.next(self.thread_local).map(|entry| {
             self.prev = entry as *const _;
 
-            EntryToken(unsafe { NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut()) }, Default::default())
+            EntryToken(
+                unsafe {
+                    NonNull::new_unchecked((entry as *const Entry<T, M, AUTO_FREE_IDS>).cast_mut())
+                },
+                Default::default(),
+            )
         })
     }
 }
 
-impl<T: Send + Sync, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> FusedIterator for Iter<'_, T, M, AUTO_FREE_IDS> {}
+impl<T: Send + Sync, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> FusedIterator
+    for Iter<'_, T, M, AUTO_FREE_IDS>
+{
+}
 
-impl<T: Send + Sync, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Iter<'_, T, M, AUTO_FREE_IDS> {
+impl<T: Send + Sync, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop
+    for Iter<'_, T, M, AUTO_FREE_IDS>
+{
     fn drop(&mut self) {
         if let Some(prev) = unsafe { self.prev.as_ref() } {
             prev.guard.store(GUARD_READY, Ordering::Release);
@@ -863,7 +965,9 @@ pub struct IterMut<'a, T: Send, M: Send + Sync + Default = (), const AUTO_FREE_I
     prev: *const Entry<T, M, AUTO_FREE_IDS>,
 }
 
-impl<'a, T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator for IterMut<'a, T, M, AUTO_FREE_IDS> {
+impl<'a, T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator
+    for IterMut<'a, T, M, AUTO_FREE_IDS>
+{
     type Item = EntryToken<'a, MutRefAccess, T, M, AUTO_FREE_IDS>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -880,9 +984,14 @@ impl<'a, T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator 
     }
 }
 
-impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> FusedIterator for IterMut<'_, T, M, AUTO_FREE_IDS> {}
+impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> FusedIterator
+    for IterMut<'_, T, M, AUTO_FREE_IDS>
+{
+}
 
-impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for IterMut<'_, T, M, AUTO_FREE_IDS> {
+impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop
+    for IterMut<'_, T, M, AUTO_FREE_IDS>
+{
     fn drop(&mut self) {
         if let Some(prev) = unsafe { self.prev.as_ref() } {
             prev.guard.store(GUARD_READY, Ordering::Release);
@@ -892,7 +1001,9 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Drop for Iter
 
 // Manual impl so we don't call Debug on the ThreadLocal, as doing so would create a reference to
 // this thread's value that potentially aliases with a mutable reference we have given out.
-impl<'a, T: Send + fmt::Debug, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> fmt::Debug for IterMut<'a, T, M, AUTO_FREE_IDS> {
+impl<'a, T: Send + fmt::Debug, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> fmt::Debug
+    for IterMut<'a, T, M, AUTO_FREE_IDS>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IterMut").field("raw", &self.raw).finish()
     }
@@ -905,7 +1016,9 @@ pub struct IntoIter<T: Send, M: Send + Sync + Default = (), const AUTO_FREE_IDS:
     raw: RawIter<GUARD_EMPTY>,
 }
 
-impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator for IntoIter<T, M, AUTO_FREE_IDS> {
+impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator
+    for IntoIter<T, M, AUTO_FREE_IDS>
+{
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
@@ -917,10 +1030,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator for 
 
                     if unsafe { &*entry }.remove_from_freelist() {
                         let ret = unsafe {
-                            mem::replace(
-                                &mut *(&*entry).value.get(),
-                                MaybeUninit::uninit(),
-                            )
+                            mem::replace(&mut *(&*entry).value.get(), MaybeUninit::uninit())
                                 .assume_init()
                         };
                         return Some(ret);
@@ -931,27 +1041,41 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> Iterator for 
     }
 }
 
-impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> FusedIterator for IntoIter<T, M, AUTO_FREE_IDS> {}
+impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool> FusedIterator
+    for IntoIter<T, M, AUTO_FREE_IDS>
+{
+}
 
-fn allocate_bucket<const AUTO_FREE_IDS: bool, T, M: Send + Sync + Default>(size: usize, bucket: usize) -> *mut Entry<T, M, AUTO_FREE_IDS> {
-    let alloc = unsafe { alloc(Layout::array::<Entry::<T, M, AUTO_FREE_IDS>>(size).unwrap()) }.cast::<Entry::<T, M, AUTO_FREE_IDS>>();
+fn allocate_bucket<const AUTO_FREE_IDS: bool, T, M: Send + Sync + Default>(
+    size: usize,
+    bucket: usize,
+) -> *mut Entry<T, M, AUTO_FREE_IDS> {
+    let alloc = unsafe { alloc(Layout::array::<Entry<T, M, AUTO_FREE_IDS>>(size).unwrap()) }
+        .cast::<Entry<T, M, AUTO_FREE_IDS>>();
     for n in 0..size {
-        unsafe { alloc.offset(n as isize).write(Entry::<T, M, AUTO_FREE_IDS> {
-            _aligned: Default::default(),
-            id: {
-                // we need to offset all entries by the number of all entries of previous buckets.
-                (1 << bucket) - 1 + n
-            },
-            guard: AtomicUsize::new(GUARD_UNINIT),
-            free_list: Default::default(),
-            meta: Default::default(),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
-        }); }
+        unsafe {
+            alloc
+                .offset(n as isize)
+                .write(Entry::<T, M, AUTO_FREE_IDS> {
+                    _aligned: Default::default(),
+                    id: {
+                        // we need to offset all entries by the number of all entries of previous buckets.
+                        (1 << bucket) - 1 + n
+                    },
+                    guard: AtomicUsize::new(GUARD_UNINIT),
+                    free_list: Default::default(),
+                    meta: Default::default(),
+                    value: UnsafeCell::new(MaybeUninit::uninit()),
+                });
+        }
     }
     alloc
 }
 
-unsafe fn deallocate_bucket<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>(bucket: NonNull<Entry<T, M, AUTO_FREE_IDS>>, size: usize) {
+unsafe fn deallocate_bucket<T, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>(
+    bucket: NonNull<Entry<T, M, AUTO_FREE_IDS>>,
+    size: usize,
+) {
     let _ = Box::from_raw(std::slice::from_raw_parts_mut(bucket.as_ptr(), size));
 }
 
@@ -960,9 +1084,7 @@ struct SizedBox<T> {
 }
 
 impl<T> SizedBox<T> {
-    const LAYOUT: Layout = {
-        Layout::new::<T>()
-    };
+    const LAYOUT: Layout = { Layout::new::<T>() };
 
     fn new(val: T) -> Self {
         // SAFETY: The layout we provided was checked at compiletime, so it has to be initialized correctly

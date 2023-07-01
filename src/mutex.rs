@@ -1,8 +1,8 @@
+use crossbeam_utils::Backoff;
 use std::cell::UnsafeCell;
 use std::intrinsics::{likely, unlikely};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use crossbeam_utils::Backoff;
 
 /// A mutex optimized for little contention.
 pub(crate) struct Mutex<T> {
@@ -11,7 +11,6 @@ pub(crate) struct Mutex<T> {
 }
 
 impl<T> Mutex<T> {
-
     pub const fn new(val: T) -> Self {
         Self {
             guard: AtomicBool::new(false),
@@ -20,12 +19,20 @@ impl<T> Mutex<T> {
     }
 
     pub fn lock(&self) -> MutexGuard<'_, T> {
-        if likely(self.guard.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()) {
+        if likely(
+            self.guard
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok(),
+        ) {
             return MutexGuard(self);
         }
 
         let backoff = Backoff::new();
-        while self.guard.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while self
+            .guard
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             backoff.snooze();
         }
         MutexGuard(self)
@@ -33,12 +40,15 @@ impl<T> Mutex<T> {
 
     #[inline]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        if unlikely(self.guard.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err()) {
+        if unlikely(
+            self.guard
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err(),
+        ) {
             return None;
         }
         Some(MutexGuard(self))
     }
-
 }
 
 unsafe impl<T: Send> Send for Mutex<T> {}

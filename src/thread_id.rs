@@ -5,18 +5,18 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use crate::mutex::Mutex;
+use crate::{Entry, BUCKETS, POINTER_WIDTH};
+use rustc_hash::FxHashMap;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cell::Cell;
-use crate::{BUCKETS, Entry, POINTER_WIDTH};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::mem::{ManuallyDrop, transmute};
+use std::mem::{transmute, ManuallyDrop};
 use std::ops::Deref;
 use std::ptr::null;
-use rustc_hash::FxHashMap;
-use crate::mutex::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // FIXME: do the mutexes actually experience low contention or should a mutex implementation that expects more contention be chosen instead?
 
@@ -32,7 +32,9 @@ impl ThreadIdManager {
     const fn new() -> Self {
         Self {
             free_from: 0,
-            free_list: unsafe { transmute::<Vec<Reverse<usize>>, BinaryHeap<Reverse<usize>>>(Vec::new()) }, // FIXME: this is unsound, use const constructor, once its available!
+            free_list: unsafe {
+                transmute::<Vec<Reverse<usize>>, BinaryHeap<Reverse<usize>>>(Vec::new())
+            }, // FIXME: this is unsound, use const constructor, once its available!
         }
     }
 
@@ -62,15 +64,21 @@ impl ThreadIdManager {
     pub(crate) fn free(&mut self, id: usize) {
         self.free_list.push(Reverse(id));
     }
-
 }
 
 impl Drop for ThreadIdManager {
     fn drop(&mut self) {
-        let buckets = POINTER_WIDTH as usize - self.free_from.next_power_of_two().leading_zeros() as usize + 1;
+        let buckets = POINTER_WIDTH as usize
+            - self.free_from.next_power_of_two().leading_zeros() as usize
+            + 1;
         for bucket in 0..buckets {
             let ptr = SHARED_IDS[bucket].get().cast_mut();
-            unsafe { dealloc(ptr.cast(), Layout::array::<AtomicUsize>(1 << bucket).unwrap_unchecked()); }
+            unsafe {
+                dealloc(
+                    ptr.cast(),
+                    Layout::array::<AtomicUsize>(1 << bucket).unwrap_unchecked(),
+                );
+            }
         }
     }
 }
@@ -85,9 +93,8 @@ fn alloc_shared(size: usize) -> *const AtomicUsize {
 
 static THREAD_ID_MANAGER: Mutex<ThreadIdManager> = Mutex::new(ThreadIdManager::new());
 
-pub(crate) static SHARED_IDS: [PtrCell<AtomicUsize>; BUCKETS] = {
-    unsafe { transmute([null::<AtomicUsize>(); BUCKETS]) }
-};
+pub(crate) static SHARED_IDS: [PtrCell<AtomicUsize>; BUCKETS] =
+    { unsafe { transmute([null::<AtomicUsize>(); BUCKETS]) } };
 
 #[inline]
 pub(crate) unsafe fn shared_id_ptr(id: usize) -> *const AtomicUsize {
@@ -100,7 +107,6 @@ pub(crate) unsafe fn shared_id_ptr(id: usize) -> *const AtomicUsize {
 pub(crate) struct PtrCell<T>(Cell<*const T>);
 
 impl<T> PtrCell<T> {
-
     #[inline]
     pub(crate) fn new(val: *const T) -> Self {
         Self(Cell::new(val))
@@ -115,7 +121,6 @@ impl<T> PtrCell<T> {
     pub(crate) fn get(&self) -> *const T {
         self.0.get()
     }
-
 }
 
 unsafe impl<T: Send> Send for PtrCell<T> {}
@@ -210,14 +215,15 @@ impl FreeList {
         let mut outstanding = 0;
         for entry in free_list.iter() {
             // sum up all the "failed" cleanups
-            if unsafe { !entry.1.cleanup(entry.0.0) } {
+            if unsafe { !entry.1.cleanup(entry.0 .0) } {
                 outstanding += 1;
             }
         }
 
         if outstanding > 0 {
             // store the number of outstanding references
-            unsafe { outstanding_shared.as_ref().unwrap_unchecked() }.store(outstanding, Ordering::Release);
+            unsafe { outstanding_shared.as_ref().unwrap_unchecked() }
+                .store(outstanding, Ordering::Release);
         } else {
             // perform the actual cleanup of the id
 

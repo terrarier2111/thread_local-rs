@@ -18,8 +18,6 @@ use std::ops::Deref;
 use std::ptr::null;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-// FIXME: do the mutexes actually experience low contention or should a mutex implementation that expects more contention be chosen instead?
-
 /// Thread ID manager which allocates thread IDs. It attempts to aggressively
 /// reuse thread IDs where possible to avoid cases where a ThreadLocal grows
 /// indefinitely when it is used by many short-lived threads.
@@ -43,11 +41,8 @@ impl ThreadIdManager {
             return id.0;
         }
 
-        // we don't allow 1 before MAX to be returned because our buckets can only contain
-        // up to usize::MAX - 1 elements, but this shouldn't have any impact in practice.
-        if self.free_from >= usize::MAX - 1 {
-            panic!("Ran out of thread IDs");
-        }
+        // `free_from` can't overflow as each thread takes up at least 2 bytes of memory and
+        // thus we can't even have `usize::MAX / 2 + 1` threads.
 
         let id = self.free_from;
         self.free_from += 1;

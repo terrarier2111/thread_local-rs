@@ -495,7 +495,7 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>
         Self::with_capacity(2)
     }
 
-    /// Creates a new empty `ThreadLocal`.
+    /// Creates a new`ThreadLocal` and inserts a single element for the current thread.
     pub fn new_insert<F, MF>(
         f: F,
         mf: MF,

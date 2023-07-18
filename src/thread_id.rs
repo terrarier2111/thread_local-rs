@@ -94,7 +94,7 @@ pub(crate) static SHARED_IDS: [PtrCell<AtomicUsize>; BUCKETS] =
 #[inline]
 pub(crate) unsafe fn shared_id_ptr(id: usize) -> *const AtomicUsize {
     let (bucket, _, index) = id_into_parts(id);
-    SHARED_IDS[bucket].get().offset(index as isize)
+    SHARED_IDS[bucket].get().add(index)
 }
 
 #[derive(Clone)]

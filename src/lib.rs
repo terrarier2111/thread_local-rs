@@ -509,11 +509,11 @@ impl<T: Send, M: Send + Sync + Default, const AUTO_FREE_IDS: bool>
     {
         // detect the amount of capacity we need.
         let thread = thread_id::get();
-        let capacity = (1 << thread.bucket) as usize;
+        let capacity = thread.bucket_size();
 
         let mut ret = Self::with_capacity(capacity);
 
-        let ptr = *ret.buckets[thread.bucket].get_mut();
+        let ptr = unsafe { *ret.buckets.get_unchecked(thread.bucket).get_mut() };
 
         // Insert the new element into the bucket
         let entry = unsafe { &*ptr.add(thread.index) };

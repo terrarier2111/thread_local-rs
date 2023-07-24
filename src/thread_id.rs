@@ -9,12 +9,12 @@ use crate::mutex::Mutex;
 use crate::{Entry, BUCKETS, POINTER_WIDTH};
 use rustc_hash::FxHashMap;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 use std::mem::{transmute, ManuallyDrop};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::ptr::null;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -143,6 +143,24 @@ impl<T> Hash for SendSyncPtr<T> {
     }
 }
 
+#[derive(Copy, Clone)]
+struct ThreadWrapper {
+    self_ptr: *const Thread,
+    thread: Thread,
+}
+
+impl ThreadWrapper {
+    
+    #[inline]
+    fn new(id: usize, free_list: *const FreeList) -> Self {
+        Self {
+            self_ptr: unsafe { (THREAD.get() as usize + memoffset::offset_of!(ThreadWrapper, thread)) as *const Thread },
+            thread: Thread::new(id, free_list),
+        }
+    }
+    
+}
+
 /// Data which is unique to the current thread while it is running.
 /// A thread ID may be reused after a thread exits.
 #[derive(Copy, Clone)]
@@ -247,9 +265,16 @@ impl EntryData {
 //
 // This makes the fast path smaller.
 #[thread_local]
-static mut THREAD: Option<Thread> = None;
+static THREAD: UnsafeCell<ThreadWrapper> = UnsafeCell::new(ThreadWrapper {
+    self_ptr: null(),
+    thread: Thread {
+        bucket: 0,
+        index: 0,
+        free_list: null(),
+    },
+});
 #[thread_local]
-static mut FREE_LIST: Option<ManuallyDrop<FreeList>> = None;
+static FREE_LIST: UnsafeCell<Option<ManuallyDrop<FreeList>>> = UnsafeCell::new(None);
 thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard }; }
 
 // Guard to ensure the thread ID is released on thread exit.
@@ -258,11 +283,15 @@ struct ThreadGuard;
 impl Drop for ThreadGuard {
     fn drop(&mut self) {
         unsafe {
-            let reference = FREE_LIST.as_ref().unwrap_unchecked().deref();
-            // first clean up all entries in the freelist
-            reference.cleanup();
+            let ptr = FREE_LIST.get();
+            {
+                let reference = ptr.as_ref().unwrap_unchecked().as_ref().unwrap_unchecked().deref();
+                // first clean up all entries in the freelist
+                reference.cleanup();
+            }
             // ... then clean up the freelist itself.
-            (reference as *const FreeList).read();
+            let ptr = ptr.as_mut().unwrap_unchecked().as_mut().unwrap_unchecked().deref_mut() as *mut FreeList;
+            ptr.drop_in_place();
         }
     }
 }
@@ -270,8 +299,9 @@ impl Drop for ThreadGuard {
 /// Returns a thread ID for the current thread, allocating one if needed.
 #[inline]
 pub(crate) fn get() -> Thread {
-    if let Some(thread) = unsafe { THREAD } {
-        thread
+    let ptr = unsafe { THREAD.get().as_ref().unwrap_unchecked().self_ptr };
+    if !ptr.is_null() {
+        unsafe { ptr.read() }
     } else {
         get_slow()
     }
@@ -282,16 +312,16 @@ pub(crate) fn get() -> Thread {
 fn get_slow() -> Thread {
     let tid = THREAD_ID_MANAGER.lock().alloc();
     unsafe {
-        FREE_LIST = Some(ManuallyDrop::new(FreeList::new(tid)));
+        *FREE_LIST.get() = Some(ManuallyDrop::new(FreeList::new(tid)));
     }
-    let new = Thread::new(tid, unsafe {
-        FREE_LIST.as_ref().unwrap_unchecked().deref() as *const FreeList
+    let new = ThreadWrapper::new(tid, unsafe {
+        FREE_LIST.get().as_ref().unwrap_unchecked().as_ref().unwrap_unchecked().deref() as *const FreeList
     });
     unsafe {
-        THREAD = Some(new);
+        *THREAD.get() = new;
     }
     THREAD_GUARD.with(|_| {});
-    new
+    new.thread
 }
 
 #[test]

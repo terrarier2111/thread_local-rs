@@ -5,7 +5,6 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use crate::mutex::Mutex;
 use crate::{Entry, BUCKETS, POINTER_WIDTH};
 use rustc_hash::FxHashMap;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
@@ -17,35 +16,39 @@ use std::mem::{transmute, ManuallyDrop};
 use std::ops::{Deref, DerefMut};
 use std::ptr::null;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::mutex::{fillable, simple};
 
 /// Thread ID manager which allocates thread IDs. It attempts to aggressively
 /// reuse thread IDs where possible to avoid cases where a ThreadLocal grows
 /// indefinitely when it is used by many short-lived threads.
 pub(crate) struct ThreadIdManager {
-    free_from: usize,
-    free_list: BinaryHeap<Reverse<usize>>,
+    free_from: AtomicUsize,
+    free_list: fillable::Mutex<BinaryHeap<Reverse<usize>>>,
 }
 
 impl ThreadIdManager {
     const fn new() -> Self {
         Self {
-            free_from: 0,
-            free_list: unsafe {
+            free_from: AtomicUsize::new(0),
+            free_list: fillable::Mutex::new_empty(unsafe {
                 transmute::<Vec<Reverse<usize>>, BinaryHeap<Reverse<usize>>>(Vec::new())
-            }, // FIXME: this is unsound, use const constructor, once its available!
+            }), // FIXME: this is unsound, use const constructor, once its available!
         }
     }
 
-    pub(crate) fn alloc(&mut self) -> usize {
-        if let Some(id) = self.free_list.pop() {
-            return id.0;
+    pub(crate) fn alloc(&self) -> usize {
+        // FIXME: this isn't smart! turn this implicit cmp_xchg into an atomic load!
+        if let Some(Some(mut guard)) = self.free_list.try_lock_full() {
+            if let Some(id) = guard.pop() {
+                return id.0;
+            } else {
+                guard.empty();
+            }
         }
 
         // `free_from` can't overflow as each thread takes up at least 2 bytes of memory and
         // thus we can't even have `usize::MAX / 2 + 1` threads.
-
-        let id = self.free_from;
-        self.free_from += 1;
+        let id = self.free_from.fetch_add(1, Ordering::Relaxed);
 
         if (id + 1).is_power_of_two() {
             let (bucket, bucket_size, _) = id_into_parts(id);
@@ -56,15 +59,15 @@ impl ThreadIdManager {
         id
     }
 
-    pub(crate) fn free(&mut self, id: usize) {
-        self.free_list.push(Reverse(id));
+    pub(crate) fn free(&self, id: usize) {
+        self.free_list.lock().push(Reverse(id));
     }
 }
 
 impl Drop for ThreadIdManager {
     fn drop(&mut self) {
         let buckets = POINTER_WIDTH as usize
-            - self.free_from.next_power_of_two().leading_zeros() as usize
+            - self.free_from.get_mut().next_power_of_two().leading_zeros() as usize
             + 1;
         for bucket in 0..buckets {
             let ptr = SHARED_IDS[bucket].get().cast_mut();
@@ -86,7 +89,7 @@ fn alloc_shared(size: usize) -> *const AtomicUsize {
     ret.cast::<AtomicUsize>().cast_const()
 }
 
-static THREAD_ID_MANAGER: Mutex<ThreadIdManager> = Mutex::new_empty(ThreadIdManager::new());
+static THREAD_ID_MANAGER: ThreadIdManager = ThreadIdManager::new();
 
 pub(crate) static SHARED_IDS: [PtrCell<AtomicUsize>; BUCKETS] =
     { unsafe { transmute([null::<AtomicUsize>(); BUCKETS]) } };
@@ -203,13 +206,13 @@ pub(crate) fn id_into_parts(id: usize) -> (usize, usize, usize) {
 
 #[inline]
 pub(crate) fn free_id(id: usize) {
-    THREAD_ID_MANAGER.lock().free(id);
+    THREAD_ID_MANAGER.free(id);
 }
 
 pub(crate) struct FreeList {
     id: usize,
     pub(crate) dropping: AtomicBool,
-    pub(crate) free_list: Mutex<FxHashMap<SendSyncPtr<Entry<()>>, EntryData>>,
+    pub(crate) free_list: simple::Mutex<FxHashMap<SendSyncPtr<Entry<()>>, EntryData>>,
 }
 
 impl FreeList {
@@ -217,7 +220,7 @@ impl FreeList {
         Self {
             id,
             dropping: Default::default(),
-            free_list: Mutex::new(FxHashMap::default()),
+            free_list: simple::Mutex::new(FxHashMap::default()),
         }
     }
 
@@ -243,7 +246,7 @@ impl FreeList {
             // Release the thread ID. Any further accesses to the thread ID
             // will go through get_slow which will either panic or
             // initialize a new ThreadGuard.
-            THREAD_ID_MANAGER.lock().free(self.id);
+            THREAD_ID_MANAGER.free(self.id);
         }
     }
 }
@@ -310,7 +313,7 @@ pub(crate) fn get() -> Thread {
 /// Out-of-line slow path for allocating a thread ID.
 #[cold]
 fn get_slow() -> Thread {
-    let tid = THREAD_ID_MANAGER.lock().alloc();
+    let tid = THREAD_ID_MANAGER.alloc();
     unsafe {
         *FREE_LIST.get() = Some(ManuallyDrop::new(FreeList::new(tid)));
     }

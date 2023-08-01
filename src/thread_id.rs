@@ -86,7 +86,7 @@ fn alloc_shared(size: usize) -> *const AtomicUsize {
     ret.cast::<AtomicUsize>().cast_const()
 }
 
-static THREAD_ID_MANAGER: Mutex<ThreadIdManager> = Mutex::new(ThreadIdManager::new());
+static THREAD_ID_MANAGER: Mutex<ThreadIdManager> = Mutex::new_empty(ThreadIdManager::new());
 
 pub(crate) static SHARED_IDS: [PtrCell<AtomicUsize>; BUCKETS] =
     { unsafe { transmute([null::<AtomicUsize>(); BUCKETS]) } };

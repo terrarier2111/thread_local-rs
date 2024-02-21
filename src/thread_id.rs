@@ -6,12 +6,12 @@
 // copied, modified, or distributed except according to those terms.
 
 use crate::{Entry, BUCKETS, POINTER_WIDTH};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cell::{Cell, UnsafeCell};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::mem::{transmute, ManuallyDrop};
 use std::ops::{Deref, DerefMut};
 use std::ptr::null;
@@ -30,9 +30,7 @@ impl ThreadIdManager {
     const fn new() -> Self {
         Self {
             free_from: AtomicUsize::new(0),
-            free_list: fillable::Mutex::new_empty(unsafe {
-                transmute::<Vec<Reverse<usize>>, BinaryHeap<Reverse<usize>>>(Vec::new())
-            }), // FIXME: this is unsound, use const constructor, once its available!
+            free_list: fillable::Mutex::new_empty(BinaryHeap::new()),
         }
     }
 
@@ -146,22 +144,31 @@ impl<T> Hash for SendSyncPtr<T> {
     }
 }
 
-#[derive(Copy, Clone)]
+struct LocalData {
+    thread: ThreadWrapper,
+    free_list: ManuallyDrop<FreeList>,
+}
+
+impl LocalData {
+
+    #[inline]
+    fn new(id: usize) -> Self {
+        let base_addr = THREAD.get() as usize;
+        Self {
+            thread: ThreadWrapper {
+                self_ptr: unsafe { (base_addr + memoffset::offset_of!(ThreadWrapper, thread)) as *const Thread },
+                thread: Thread::new(id),
+            },
+            free_list: ManuallyDrop::new(FreeList::new(id)),
+        }
+    }
+
+}
+
+#[derive(Clone, Copy)]
 struct ThreadWrapper {
     self_ptr: *const Thread,
     thread: Thread,
-}
-
-impl ThreadWrapper {
-    
-    #[inline]
-    fn new(id: usize, free_list: *const FreeList) -> Self {
-        Self {
-            self_ptr: unsafe { (THREAD.get() as usize + memoffset::offset_of!(ThreadWrapper, thread)) as *const Thread },
-            thread: Thread::new(id, free_list),
-        }
-    }
-    
 }
 
 /// Data which is unique to the current thread while it is running.
@@ -173,17 +180,15 @@ pub(crate) struct Thread {
     pub(crate) bucket: usize,
     /// The index into the bucket this thread's local storage is in.
     pub(crate) index: usize,
-    pub(crate) free_list: *const FreeList,
 }
 
 impl Thread {
-    fn new(id: usize, free_list: *const FreeList) -> Self {
+    fn new(id: usize) -> Self {
         let (bucket, _, index) = id_into_parts(id);
 
         Self {
             bucket,
             index,
-            free_list,
         }
     }
 
@@ -209,25 +214,27 @@ pub(crate) fn free_id(id: usize) {
     THREAD_ID_MANAGER.free(id);
 }
 
+const HASHER: BuildHasherDefault<FxHasher> = unsafe { transmute(()) }; // FIXME: this is unsound, use proper const constructor once its available!
+
 pub(crate) struct FreeList {
-    id: usize,
+    id: Cell<usize>,
     pub(crate) dropping: AtomicBool,
     pub(crate) free_list: simple::Mutex<FxHashMap<SendSyncPtr<Entry<()>>, EntryData>>,
 }
 
 impl FreeList {
-    fn new(id: usize) -> Self {
+    const fn new(id: usize) -> Self {
         Self {
-            id,
-            dropping: Default::default(),
-            free_list: simple::Mutex::new(FxHashMap::default()),
+            id: Cell::new(id),
+            dropping: AtomicBool::new(false),
+            free_list: simple::Mutex::new(FxHashMap::with_hasher(HASHER)),
         }
     }
 
     fn cleanup(&self) {
         self.dropping.store(true, Ordering::Release);
         let free_list = self.free_list.lock();
-        let outstanding_shared = unsafe { shared_id_ptr(self.id) };
+        let outstanding_shared = unsafe { shared_id_ptr(self.id.get()) };
         let mut outstanding = 0;
         for entry in free_list.iter() {
             // sum up all the "failed" cleanups
@@ -246,7 +253,7 @@ impl FreeList {
             // Release the thread ID. Any further accesses to the thread ID
             // will go through get_slow which will either panic or
             // initialize a new ThreadGuard.
-            THREAD_ID_MANAGER.free(self.id);
+            THREAD_ID_MANAGER.free(self.id.get());
         }
     }
 }
@@ -268,16 +275,16 @@ impl EntryData {
 //
 // This makes the fast path smaller.
 #[thread_local]
-static THREAD: UnsafeCell<ThreadWrapper> = UnsafeCell::new(ThreadWrapper {
-    self_ptr: null(),
-    thread: Thread {
-        bucket: 0,
-        index: 0,
-        free_list: null(),
+static THREAD: UnsafeCell<LocalData> = UnsafeCell::new(LocalData {
+    thread: ThreadWrapper {
+        self_ptr: null(),
+        thread: Thread {
+            bucket: 0,
+            index: 0,
+        },
     },
+    free_list: ManuallyDrop::new(FreeList::new(0)), // use 0 as a decoy
 });
-#[thread_local]
-static FREE_LIST: UnsafeCell<Option<ManuallyDrop<FreeList>>> = UnsafeCell::new(None);
 thread_local! { static THREAD_GUARD: ThreadGuard = const { ThreadGuard }; }
 
 // Guard to ensure the thread ID is released on thread exit.
@@ -285,26 +292,21 @@ struct ThreadGuard;
 
 impl Drop for ThreadGuard {
     fn drop(&mut self) {
-        unsafe {
-            let ptr = FREE_LIST.get();
-            {
-                let reference = ptr.as_ref().unwrap_unchecked().as_ref().unwrap_unchecked().deref();
-                // first clean up all entries in the freelist
-                reference.cleanup();
-            }
-            // ... then clean up the freelist itself.
-            let ptr = ptr.as_mut().unwrap_unchecked().as_mut().unwrap_unchecked().deref_mut() as *mut FreeList;
-            ptr.drop_in_place();
+        {
+            // first clean up all entries in the freelist
+            unsafe { (&*THREAD.get()).free_list.cleanup(); }
         }
+        // ... then clean up the freelist itself.
+        unsafe { (&(&*THREAD.get()).free_list as *const ManuallyDrop<FreeList>).cast::<FreeList>().read(); }
     }
 }
 
 /// Returns a thread ID for the current thread, allocating one if needed.
 #[inline]
-pub(crate) fn get() -> Thread {
-    let ptr = unsafe { THREAD.get().as_ref().unwrap_unchecked().self_ptr };
-    if !ptr.is_null() {
-        unsafe { ptr.read() }
+pub(crate) fn get() -> (Thread, *const FreeList) {
+    let ptr = unsafe { *THREAD.get().cast::<ThreadWrapper>().byte_add(memoffset::offset_of!(LocalData, thread)) };
+    if !ptr.self_ptr.is_null() {
+        (unsafe { ptr.self_ptr.read() }, unsafe { ptr.self_ptr.byte_offset((memoffset::offset_of!(LocalData, free_list) as isize) - (memoffset::offset_of!(LocalData, thread) as isize) - (memoffset::offset_of!(ThreadWrapper, thread) as isize)).cast::<FreeList>() })
     } else {
         get_slow()
     }
@@ -312,45 +314,41 @@ pub(crate) fn get() -> Thread {
 
 /// Out-of-line slow path for allocating a thread ID.
 #[cold]
-fn get_slow() -> Thread {
+fn get_slow() -> (Thread, *const FreeList) {
     let tid = THREAD_ID_MANAGER.alloc();
-    unsafe {
-        *FREE_LIST.get() = Some(ManuallyDrop::new(FreeList::new(tid)));
-    }
-    let new = ThreadWrapper::new(tid, unsafe {
-        FREE_LIST.get().as_ref().unwrap_unchecked().as_ref().unwrap_unchecked().deref() as *const FreeList
-    });
+    let new = LocalData::new(tid);
+    let ret = new.thread.thread.clone();
+    let self_ptr = new.thread.self_ptr;
     unsafe {
         *THREAD.get() = new;
     }
     THREAD_GUARD.with(|_| {});
-    new.thread
+    (ret, unsafe { self_ptr.byte_offset((memoffset::offset_of!(LocalData, free_list) as isize) - (memoffset::offset_of!(LocalData, thread) as isize) - (memoffset::offset_of!(ThreadWrapper, thread) as isize)).cast::<FreeList>() })
 }
 
 #[test]
 fn test_thread() {
-    use std::ptr::null;
-    let thread = Thread::new(0, null());
+    let thread = Thread::new(0);
     assert_eq!(thread.bucket, 0);
     assert_eq!(thread.bucket_size(), 1);
     assert_eq!(thread.index, 0);
 
-    let thread = Thread::new(1, null());
+    let thread = Thread::new(1);
     assert_eq!(thread.bucket, 1);
     assert_eq!(thread.bucket_size(), 2);
     assert_eq!(thread.index, 0);
 
-    let thread = Thread::new(2, null());
+    let thread = Thread::new(2);
     assert_eq!(thread.bucket, 1);
     assert_eq!(thread.bucket_size(), 2);
     assert_eq!(thread.index, 1);
 
-    let thread = Thread::new(3, null());
+    let thread = Thread::new(3);
     assert_eq!(thread.bucket, 2);
     assert_eq!(thread.bucket_size(), 4);
     assert_eq!(thread.index, 0);
 
-    let thread = Thread::new(19, null());
+    let thread = Thread::new(19);
     assert_eq!(thread.bucket, 4);
     assert_eq!(thread.bucket_size(), 16);
     assert_eq!(thread.index, 4);
